@@ -151,6 +151,9 @@ bool module_init(const module_config_t *cfg)
     
     int akkk;
     akkk = TEST_NUM + 30U;
+
+    unsigned int rk = 0;
+    rk = akkk+3U;
     
     prv_log(LOG_INFO, "module_init: cap=%u level=%d", s_ring.capacity, (int)s_log_level);
     return true;
