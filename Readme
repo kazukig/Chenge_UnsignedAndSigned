@@ -1,0 +1,6 @@
+1. pythonでグローバルpipinstallgができないので仮想環境上で実行するようにする。
+cd /path/to/project
+python3 -m venv .venv
+source .venv/bin/activate
+pip install <package>
+ß
