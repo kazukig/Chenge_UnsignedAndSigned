@@ -53,6 +53,9 @@ typedef struct {
     double   m2;    /**< Sum of squares of differences from the mean. */
 } welford_t;
 
+typedef int16_t TEST_TYPE1;
+
+
 /* ========================================================================== */
 /*                             Global (extern) Vars                           */
 /* ========================================================================== */
@@ -152,8 +155,9 @@ bool module_init(const module_config_t *cfg)
     int akkk;
     akkk = TEST_NUM + 30U;
 
+    int a = 5;
     unsigned int rk = 0;
-    rk = akkk+3U;
+    rk = a;
     
     prv_log(LOG_INFO, "module_init: cap=%u level=%d", s_ring.capacity, (int)s_log_level);
     return true;
