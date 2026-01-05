@@ -51,14 +51,14 @@ class GitHost:
         if user_email:
             self._run_git(["config", "user.email", user_email])
 
-        # remote に token を埋め込む（必要なら）
+        # remote に username/token を埋め込む（必要なら）
         if username and token:
             try:
                 cur = self._run_git(["remote", "get-url", self.remote]).strip()
                 self._orig_remote_url = cur
                 # only handle https remote URL type here
                 if cur.startswith("https://"):
-                    # embed credentials
+                    # embed credentials as token in URL
                     # 例: https://github.com/owner/repo.git -> https://username:token@github.com/owner/repo.git
                     without_proto = cur[len("https://") :]
                     new = f"https://{username}:{token}@{without_proto}"
@@ -150,6 +150,12 @@ class GitHost:
     def _run_git(self, args: List[str]) -> str:
         """repo_path をカレントにして git コマンドを実行し、標準出力を返す。例外は呼び出し元で処理。"""
         cmd = ["git"] + args
+        # コマンド内容を出力（実行時に確認できるようにする）
+        try:
+            print("printf: {}".format(" ".join(cmd)), flush=True)
+        except Exception:
+            # 出力失敗しても処理は続ける
+            pass
         res = subprocess.run(cmd, cwd=self.repo_path, capture_output=True, text=True)
         if res.returncode != 0:
             # include stderr for debugging

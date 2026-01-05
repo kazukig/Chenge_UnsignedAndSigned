@@ -3,6 +3,8 @@ import re
 import sys
 import subprocess
 import tempfile
+import shutil
+import json
 from clang import cindex
 from Git.GitHost import GitHost
 from analyzer.CodeAnalyzer import CodeAnalyzer
@@ -11,15 +13,12 @@ from fixer.SignedTypeFixer import SignedTypeFixer
 class CommitManager:
     """
     main 側のコミット / JSON 出力処理を担当するクラス。
-
-    実行ルール:
-      - コマンドライン第2引数 (sys.argv[2]) が "1" の場合 -> Git に commit & push を行う
-      - それ以外 -> 修正結果を result.json として出力する
     """
-    def __init__(self, repo_path='henge_UnsignedAndSigned', user_name='kazukig', user_email='mannen5656@gmail.com'):
+    def __init__(self, repo_path='henge_UnsignedAndSigned', user_name='kazukig', user_email='mannen5656@gmail.com', token=None):
         self.repo_path = repo_path
         self.user_name = user_name
         self.user_email = user_email
+        self.token = token
 
     def _compute_column(self, before_line: str, after_line: str) -> int:
         if before_line is None:
@@ -35,20 +34,69 @@ class CommitManager:
             pass
         return 1
 
-    def perform(self, commit_flag: str, result, src_path: str):
+    def makeOutputFile(self, input_path: str, output_path: str, res) -> bool:
+        """
+        入力パスのファイルをコピーし、res に従って該当行を置換して出力パスに書き出す。
+        res: [指摘番号, 行番号, 成功フラグ, 修正後の行文字列]
+        入力と出力が同一パスなら上書きする。
+        成功時 True, 失敗時 False を返す。
+        """
+        try:
+            with open(input_path, 'r', encoding='utf-8', errors='ignore') as rf:
+                lines = rf.readlines()
+        except Exception:
+            return False
+
+        # デフォルトはコピーのみ
+        new_lines = list(lines)
+
+        try:
+            if isinstance(res, (list, tuple)) and len(res) >= 4:
+                try:
+                    ln = int(res[1])
+                except Exception:
+                    ln = None
+                ok = bool(res[2])
+                new_line_text = res[3] if res[3] is not None else ""
+                if ok and ln and 1 <= ln <= len(new_lines):
+                    # Ensure newline at end
+                    if not new_line_text.endswith("\n"):
+                        new_line_text = new_line_text + "\n"
+                    new_lines[ln - 1] = new_line_text
+        except Exception:
+            return False
+
+        # 出力先ディレクトリ作成
+        out_dir = os.path.dirname(output_path) or "."
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception:
+            pass
+
+        try:
+            with open(output_path, 'w', encoding='utf-8') as wf:
+                wf.writelines(new_lines)
+            return True
+        except Exception:
+            return False
+
+    def perform(self, commit_flag: str, result, src_path: str, message=None):
         """
         result: fixer.solveSignedTypedConflict の戻り値想定 [id, line, ok_bool, new_line_text]
         src_path: example.c のパス
+        message: commit message に使う（None ならデフォルトを生成）
         """
         flag = commit_flag
 
         # 成功かつコミットフラグが '1' の場合は Git commit & push
+        print(result)
         if flag == "1" and isinstance(result, (list, tuple)) and len(result) >= 4 and result[2]:
             try:
                 gh = GitHost(
                     repo_path=self.repo_path,
                     user_name=self.user_name,
-                    user_email=self.user_email
+                    user_email=self.user_email,
+                    token=self.token
                 )
                 try:
                     with open(src_path, 'r', encoding='utf-8') as rf:
@@ -61,12 +109,23 @@ class CommitManager:
                     "action": "modify",
                     "content": content
                 }]
-                commit_res = gh.commitAndPush(changes, message=f"Toggle signedness at line {result[1]}")
+
+                commit_msg = None
+                if message is not None:
+                    # message がリスト等なら文字列化して使う
+                    if isinstance(message, (list, tuple, dict)):
+                        commit_msg = json.dumps(message, ensure_ascii=False)
+                    else:
+                        commit_msg = str(message)
+                else:
+                    commit_msg = f"Toggle signedness at line {result[1]}"
+
+                commit_res = gh.commitAndPush(changes, message=commit_msg)
                 return commit_res
             except Exception as e:
                 return {"ok": False, "reason": f"git failed: {e}"}
 
-        # それ以外は result.json を作成
+        # それ以外は result.json を作成（既存処理）
         try:
             file_name = os.path.basename(src_path)
             before_line = ""
@@ -97,7 +156,7 @@ class CommitManager:
             return {"ok": False, "reason": f"write result.json failed: {e}"}
 
 if __name__ == "__main__":
-    src = "../input/example.c"
+    src = "../test_kaizen/example.c"
     args = ["-std=c11", "-Iinclude"]
 
     # 最初にマクロ表と型表を作成する
@@ -113,6 +172,16 @@ if __name__ == "__main__":
     print("修正結果:", res)
 
     # コミット/JSON 出力は CommitManager に委譲する
-    mgr = CommitManager(repo_path='henge_UnsignedAndSigned', user_name='kazukig', user_email='mannen5656@gmail.com')
-    op_res = mgr.perform(None, res, src)
+    mgr = CommitManager(repo_path='../test_kaizen', user_name='kazukig', user_email='mannen5656@gmail.com', token='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')
+
+    # ここで出力ファイルを生成（入力=出力で上書き）
+    wrote = mgr.makeOutputFile(src, src, res)
+    print("makeOutputFile wrote:", wrote)
+
+    # ファイル化ができたら perform を呼び出し、res を commit message として渡す
+    if wrote:
+        op_res = mgr.perform("1", res, src, message=res)
+    else:
+        op_res = {"ok": False, "reason": "makeOutputFile failed"}
+
     print("CommitManager result:", op_res)

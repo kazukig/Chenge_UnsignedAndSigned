@@ -201,12 +201,12 @@ class SignedTypeFixer:
 
     def _replace_literal_with_toggled(self, line: str, token: str, new_type: str):
         """
-        整数リテラル token を ((new_type)token) に置換する。
+        整数リテラル token を (new_type)token に置換する。
         置換が起きた場合は (new_line, True) を返す。
         """
         try:
             pat = r'(?<![\w_])' + re.escape(token) + r'(?![\w_])'
-            repl = f'(({new_type}){token})'
+            repl = f'({new_type}){token}'
             new_line, n = re.subn(pat, repl, line)
             return new_line, n > 0
         except Exception:
@@ -219,7 +219,7 @@ class SignedTypeFixer:
         """
         try:
             pat = r'(?<![\w_])' + re.escape(varname) + r'(?![\w_])'
-            repl = f'(({new_type}){varname})'
+            repl = f'({new_type}){varname}'
             new_line, n = re.subn(pat, repl, line)
             return new_line, n > 0
         except Exception:
