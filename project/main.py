@@ -172,7 +172,7 @@ if __name__ == "__main__":
     print("修正結果:", res)
 
     # コミット/JSON 出力は CommitManager に委譲する
-    mgr = CommitManager(repo_path='../test_kaizen', user_name='kazukig', user_email='mannen5656@gmail.com', token='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')
+    mgr = CommitManager(repo_path='../test_kaizen', user_name='kazukig', user_email='mannen5656@gmail.com', token=None)
 
     # ここで出力ファイルを生成（入力=出力で上書き）
     wrote = mgr.makeOutputFile(src, src, res)
