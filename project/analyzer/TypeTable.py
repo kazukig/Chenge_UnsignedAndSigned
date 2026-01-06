@@ -1,3 +1,4 @@
+import re
 
 # 追加: typedef テーブル（型別名テーブル）
 class TypeTable:
@@ -37,7 +38,10 @@ class TypeTable:
             pass
 
         # 基本的な整数型を自分自身に紐付けておく（見つからない場合にも対応）
-        for t in ("int8_t","int16_t","int32_t","int64_t","uint8_t","uint16_t","uint32_t","uint64_t","int","unsigned int","unsigned"):
+        for t in ("int8_t","int16_t","int32_t","int64_t",
+                  "uint8_t","uint16_t","uint32_t","uint64_t",
+                  "int","unsigned int","unsigned",
+                  "float","double","bool","char","signed char","unsigned char"):
             if t not in typedefs:
                 typedefs[t] = t
                 # def_lines は空にしておく

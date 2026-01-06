@@ -9,6 +9,9 @@ from clang import cindex
 from Git.GitHost import GitHost
 from analyzer.CodeAnalyzer import CodeAnalyzer
 from fixer.SignedTypeFixer import SignedTypeFixer
+from analyzer.MacroTable import MacroTable
+from analyzer.TypeTable import TypeTable
+
 
 class CommitManager:
     """
@@ -160,28 +163,32 @@ if __name__ == "__main__":
     args = ["-std=c11", "-Iinclude"]
 
     # 最初にマクロ表と型表を作成する
-    #mtab = MicroTable(src_file=src, compile_args=args).make()
-    #ttab = TypeTable(src_file=src, compile_args=args).make()
+    #mtab = MacroTable(src_file=src, compile_args=args).make()
+    ttab = TypeTable(src_file=src, compile_args=args).make()
+
+    # コミット/JSON 出力は CommitManager に委譲する
+    mgr = CommitManager(repo_path='../test_kaizen', user_name='kazukig', user_email='mannen5656@gmail.com', token="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")
 
     analyzer = CodeAnalyzer(src_file=src, compile_args=args)
     x = analyzer.run()
-    # SignedTypeFixer にテーブルを渡す
-    fixer = SignedTypeFixer(src_file=src, compile_args=args, macro_table=None, type_table=None)
-    # 例: 指摘番号 0, 行 157 を処理
-    res = fixer.solveSignedTypedConflict(x, [0,160])
-    print("修正結果:", res)
+    
+    #指摘表([指摘番号,行番号])
+    chlist = [[0,56], [0,66],[0,72]]
+    for coords in chlist:
+        # SignedTypeFixer にテーブルを渡す
+        fixer = SignedTypeFixer(src_file=src, compile_args=args, macro_table=None, type_table=ttab)
+        # 例: 指摘番号 0, 行 157 を処理
+        res = fixer.solveSignedTypedConflict(x, coords)
+        print("修正結果:", res)
 
-    # コミット/JSON 出力は CommitManager に委譲する
-    mgr = CommitManager(repo_path='../test_kaizen', user_name='kazukig', user_email='mannen5656@gmail.com', token=None)
+        # ここで出力ファイルを生成（入力=出力で上書き）
+        wrote = mgr.makeOutputFile(src, src, res)
+        print("makeOutputFile wrote:", wrote)
 
-    # ここで出力ファイルを生成（入力=出力で上書き）
-    wrote = mgr.makeOutputFile(src, src, res)
-    print("makeOutputFile wrote:", wrote)
+        # ファイル化ができたら perform を呼び出し、res を commit message として渡す
+        if wrote:
+            op_res = mgr.perform("1", res, src, message=res)
+        else:
+            op_res = {"ok": False, "reason": "makeOutputFile failed"}
 
-    # ファイル化ができたら perform を呼び出し、res を commit message として渡す
-    if wrote:
-        op_res = mgr.perform("1", res, src, message=res)
-    else:
-        op_res = {"ok": False, "reason": "makeOutputFile failed"}
-
-    print("CommitManager result:", op_res)
+        print("CommitManager result:", op_res)

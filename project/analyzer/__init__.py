@@ -1,3 +1,3 @@
 from . import CodeAnalyzer
-from . import MicroTable
+from . import MacroTable
 from . import TypeTable
