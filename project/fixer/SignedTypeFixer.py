@@ -8,6 +8,9 @@ from clang import cindex
 
 # 新しいクラス: 署名付き/非署名の衝突を解決するための修正器
 class SignedTypeFixer:
+    # 整数リテラルのパターン (数値部分と接尾子を分離するため)
+    _INTEGER_LITERAL_PATTERN = r'^(0x[0-9A-Fa-f]+|[0-9]+)[uUlL]*$'
+    
     def __init__(self, src_file="example.c", compile_args=None, macro_table=None, type_table=None):
         self.src_file = src_file
         self.compile_args = compile_args or ["-std=c11", "-Iinclude"]
@@ -347,7 +350,7 @@ class SignedTypeFixer:
         if not token:
             return False
         # 10進、16進、接尾子(u,l) を許容
-        return bool(re.match(r'^(0x[0-9A-Fa-f]+|[0-9]+)[uUlL]*$', token))
+        return bool(re.match(self._INTEGER_LITERAL_PATTERN, token))
 
     def _strip_literal_suffix(self, token: str) -> str:
         """
@@ -356,7 +359,7 @@ class SignedTypeFixer:
         """
         if not token:
             return token
-        m = re.match(r'^(0x[0-9A-Fa-f]+|[0-9]+)[uUlL]*$', token)
+        m = re.match(self._INTEGER_LITERAL_PATTERN, token)
         if m:
             return m.group(1)
         return token
