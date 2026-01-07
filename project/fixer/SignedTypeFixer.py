@@ -360,20 +360,22 @@ class SignedTypeFixer:
             # 判定: 目的型が unsigned かどうか
             make_unsigned = self._is_unsigned(new_type)
 
-            # トークンがすでにサフィックスを含んでいる場合は、ベース部分とサフィックスを分離
-            # 例: "30U" -> base="30", existing_suffix="U"
+            # トークンがすでにサフィックスを含んでいる場合は、ベース部分を抽出
+            # 例: "30U" -> base="30"
             base_num_match = re.match(r'^(0x[0-9A-Fa-f]+|[0-9]+)([uUlL]*)$', token)
             if base_num_match:
+                # ベース数値部分だけを使用してパターンを構築
                 base_num = base_num_match.group(1)
-                # トークンに続く追加の接尾子も捕捉するパターン
-                # 例: コード中の "30U" または "30UL" などをマッチ
+                # コード中のベース数値にマッチし、その後の接尾子を捕捉
                 pat = r'(?<![\w_])' + re.escape(base_num) + r'([uUlL]*)(?![\w_])'
+                use_base_only = True
             else:
                 # トークンが通常の形式でない場合は従来通り
                 pat = r'(?<![\w_])(' + re.escape(token) + r')([uUlL]*)' + r'(?![\w_])'
+                use_base_only = False
 
             def repl(m):
-                if base_num_match:
+                if use_base_only:
                     # ベース数値とサフィックスを分離して処理
                     lit = base_num
                     suffix = m.group(1) or ""
