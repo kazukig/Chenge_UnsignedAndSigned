@@ -323,10 +323,12 @@ class SignedTypeFixer:
 
                 # リテラルの場合は既に U サフィックスがあるか確認して不要ならスキップ
                 if self._is_integer_literal_token(target_name):
+                    # リテラルから接尾子を除いた数値部分を取得
+                    literal_base = self._strip_literal_suffix(target_name)
                     # もし変換先が unsigned で既に U が付いているなら不要
-                    if self._is_unsigned(new_type) and self._literal_has_unsigned_suffix(new_line_text, target_name):
+                    if self._is_unsigned(new_type) and self._literal_has_unsigned_suffix(new_line_text, literal_base):
                         continue
-                    new_line_text, did = self._replace_literal_with_toggled(new_line_text, target_name, new_type)
+                    new_line_text, did = self._replace_literal_with_toggled(new_line_text, literal_base, new_type)
                 else:
                     new_line_text, did = self._replace_var_with_cast(new_line_text, target_name, new_type)
 
@@ -346,6 +348,18 @@ class SignedTypeFixer:
             return False
         # 10進、16進、接尾子(u,l) を許容
         return bool(re.match(r'^(0x[0-9A-Fa-f]+|[0-9]+)[uUlL]*$', token))
+
+    def _strip_literal_suffix(self, token: str) -> str:
+        """
+        整数リテラルから接尾子 (u/U/l/L) を取り除いて数値部分のみを返す。
+        例: "3U" -> "3", "0x10UL" -> "0x10", "42" -> "42"
+        """
+        if not token:
+            return token
+        m = re.match(r'^(0x[0-9A-Fa-f]+|[0-9]+)[uUlL]*$', token)
+        if m:
+            return m.group(1)
+        return token
 
     def _replace_literal_with_toggled(self, line: str, token: str, new_type: str):
         """
