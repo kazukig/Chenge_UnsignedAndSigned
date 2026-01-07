@@ -360,13 +360,26 @@ class SignedTypeFixer:
             # 判定: 目的型が unsigned かどうか
             make_unsigned = self._is_unsigned(new_type)
 
-            # トークンに続く接尾子 (u/U/l/L の任意順) を捕捉
-            # 例マッチ: 4, 4U, 0x10U, 123ul
-            pat = r'(?<![\w_])(' + re.escape(token) + r')([uUlL]*)' + r'(?![\w_])'
+            # トークンがすでにサフィックスを含んでいる場合は、ベース部分とサフィックスを分離
+            # 例: "30U" -> base="30", existing_suffix="U"
+            base_num_match = re.match(r'^(0x[0-9A-Fa-f]+|[0-9]+)([uUlL]*)$', token)
+            if base_num_match:
+                base_num = base_num_match.group(1)
+                # トークンに続く追加の接尾子も捕捉するパターン
+                # 例: コード中の "30U" または "30UL" などをマッチ
+                pat = r'(?<![\w_])' + re.escape(base_num) + r'([uUlL]*)(?![\w_])'
+            else:
+                # トークンが通常の形式でない場合は従来通り
+                pat = r'(?<![\w_])(' + re.escape(token) + r')([uUlL]*)' + r'(?![\w_])'
 
             def repl(m):
-                lit = m.group(1)
-                suffix = m.group(2) or ""
+                if base_num_match:
+                    # ベース数値とサフィックスを分離して処理
+                    lit = base_num
+                    suffix = m.group(1) or ""
+                else:
+                    lit = m.group(1)
+                    suffix = m.group(2) or ""
                 # normalize suffix letters except keep L's
                 has_Ls = "".join([c for c in suffix if c.lower() == 'l'])
                 if make_unsigned:
