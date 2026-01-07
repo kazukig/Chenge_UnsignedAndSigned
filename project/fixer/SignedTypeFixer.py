@@ -8,6 +8,7 @@ from clang import cindex
 
 # Module-level constants for regex patterns
 _INTEGER_LITERAL_PATTERN = re.compile(r'^(0x[0-9A-Fa-f]+|[0-9]+)([uUlL]*)$')
+_UNSIGNED_SUFFIX_PATTERN = re.compile(r'([uU][lL]*)')
 
 # 新しいクラス: 署名付き/非署名の衝突を解決するための修正器
 class SignedTypeFixer:
@@ -199,9 +200,12 @@ class SignedTypeFixer:
             return False
 
     def _literal_has_unsigned_suffix(self, line: str, token: str) -> bool:
+        """
+        Check if a literal token in the line has an unsigned suffix (U or u).
+        """
         try:
-            pat = re.compile(r'(?<![\w_])' + re.escape(token) + r'([uU][lL]*)' + r'(?![\w_])')
-            return bool(pat.search(line))
+            pat = r'(?<![\w_])' + re.escape(token) + r'([uU][lL]*)(?![\w_])'
+            return bool(re.search(pat, line))
         except Exception:
             return False
 
@@ -345,10 +349,12 @@ class SignedTypeFixer:
                     False, None]
 
     def _is_integer_literal_token(self, token: str) -> bool:
+        """
+        Check if token is an integer literal (decimal or hex) with optional suffixes.
+        """
         if not token:
             return False
-        # 10進、16進、接尾子(u,l) を許容
-        return bool(re.match(r'^(0x[0-9A-Fa-f]+|[0-9]+)[uUlL]*$', token))
+        return bool(_INTEGER_LITERAL_PATTERN.match(token))
 
     def _build_literal_pattern(self, token_to_match: str) -> str:
         """
@@ -388,15 +394,12 @@ class SignedTypeFixer:
             make_unsigned = self._is_unsigned(new_type)
 
             # トークンがすでにサフィックスを含んでいる場合は、ベース部分を抽出
-            # 例: "30U" -> base="30"
+            # 例: "30U" -> base="30"、そうでない場合はトークンをそのまま使用
             base_num_match = _INTEGER_LITERAL_PATTERN.match(token)
-            if base_num_match:
-                # ベース数値部分だけを使用してパターンを構築
-                base_num = base_num_match.group(1)
-                pat = self._build_literal_pattern(base_num)
-            else:
-                # トークンが通常の形式でない場合は従来通り
-                pat = self._build_literal_pattern(token)
+            token_to_match = base_num_match.group(1) if base_num_match else token
+            
+            # パターンを構築
+            pat = self._build_literal_pattern(token_to_match)
 
             def repl(m):
                 # 両方のブランチで一貫してマッチグループを使用
