@@ -8,7 +8,6 @@ from clang import cindex
 
 # Module-level constants for regex patterns
 _INTEGER_LITERAL_PATTERN = re.compile(r'^(0x[0-9A-Fa-f]+|[0-9]+)([uUlL]*)$')
-_UNSIGNED_SUFFIX_PATTERN = re.compile(r'([uU][lL]*)')
 
 # 新しいクラス: 署名付き/非署名の衝突を解決するための修正器
 class SignedTypeFixer:
@@ -368,14 +367,15 @@ class SignedTypeFixer:
         接尾子を正規化する。
         - 複数の L は1つの LL に正規化
         - U は追加または削除
+        - C標準に従い、U は L の前に配置 (例: UL, ULL)
         """
         # L の数を数える (1つなら L、2つ以上なら LL)
-        l_count = sum(1 for c in suffix if c.lower() == 'l')
+        l_count = suffix.lower().count('l')
         has_l = 'LL' if l_count >= 2 else ('L' if l_count == 1 else '')
         
         if make_unsigned:
-            # unsigned への変換: U を追加 (L があれば先に配置)
-            return has_l + 'U'
+            # unsigned への変換: U を L の前に配置 (C標準の慣例に従う)
+            return 'U' + has_l
         else:
             # signed への変換: U を削除、L のみ保持
             return has_l
