@@ -6,6 +6,9 @@ import tempfile
 from typing import Optional
 from clang import cindex
 
+# Module-level constants for regex patterns
+_INTEGER_LITERAL_PATTERN = re.compile(r'^(0x[0-9A-Fa-f]+|[0-9]+)([uUlL]*)$')
+
 # 新しいクラス: 署名付き/非署名の衝突を解決するための修正器
 class SignedTypeFixer:
     def __init__(self, src_file="example.c", compile_args=None, macro_table=None, type_table=None):
@@ -347,6 +350,30 @@ class SignedTypeFixer:
         # 10進、16進、接尾子(u,l) を許容
         return bool(re.match(r'^(0x[0-9A-Fa-f]+|[0-9]+)[uUlL]*$', token))
 
+    def _build_literal_pattern(self, token_to_match: str) -> str:
+        """
+        リテラルトークンにマッチする正規表現パターンを構築する。
+        トークンとその後のサフィックスをキャプチャグループで捕捉する。
+        """
+        return r'(?<![\w_])(' + re.escape(token_to_match) + r')([uUlL]*)(?![\w_])'
+
+    def _normalize_suffix(self, suffix: str, make_unsigned: bool) -> str:
+        """
+        接尾子を正規化する。
+        - 複数の L は1つの LL に正規化
+        - U は追加または削除
+        """
+        # L の数を数える (1つなら L、2つ以上なら LL)
+        l_count = sum(1 for c in suffix if c.lower() == 'l')
+        has_l = 'LL' if l_count >= 2 else ('L' if l_count == 1 else '')
+        
+        if make_unsigned:
+            # unsigned への変換: U を追加 (L があれば先に配置)
+            return has_l + 'U'
+        else:
+            # signed への変換: U を削除、L のみ保持
+            return has_l
+
     def _replace_literal_with_toggled(self, line: str, token: str, new_type: str):
         """
         整数リテラル token を unsigned へ変換する場合は接尾子に U を追加、
@@ -362,28 +389,21 @@ class SignedTypeFixer:
 
             # トークンがすでにサフィックスを含んでいる場合は、ベース部分を抽出
             # 例: "30U" -> base="30"
-            base_num_match = re.match(r'^(0x[0-9A-Fa-f]+|[0-9]+)([uUlL]*)$', token)
+            base_num_match = _INTEGER_LITERAL_PATTERN.match(token)
             if base_num_match:
                 # ベース数値部分だけを使用してパターンを構築
-                # パターンは一貫性のため、ベース数値とサフィックスの両方をキャプチャ
                 base_num = base_num_match.group(1)
-                pat = r'(?<![\w_])(' + re.escape(base_num) + r')([uUlL]*)(?![\w_])'
+                pat = self._build_literal_pattern(base_num)
             else:
                 # トークンが通常の形式でない場合は従来通り
-                pat = r'(?<![\w_])(' + re.escape(token) + r')([uUlL]*)' + r'(?![\w_])'
+                pat = self._build_literal_pattern(token)
 
             def repl(m):
                 # 両方のブランチで一貫してマッチグループを使用
                 lit = m.group(1)
                 suffix = m.group(2) or ""
-                # normalize suffix letters except keep L's
-                has_Ls = "".join([c for c in suffix if c.lower() == 'l'])
-                if make_unsigned:
-                    # ensure a single uppercase U present (preserve Ls)
-                    new_suffix = has_Ls + "U"
-                else:
-                    # remove any U/u, preserve Ls
-                    new_suffix = has_Ls
+                # 接尾子を正規化
+                new_suffix = self._normalize_suffix(suffix, make_unsigned)
                 return lit + new_suffix
 
             new_line, n = re.subn(pat, repl, line)
