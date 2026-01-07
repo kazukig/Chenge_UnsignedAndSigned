@@ -8,6 +8,9 @@ from clang import cindex
 
 # 新しいクラス: 署名付き/非署名の衝突を解決するための修正器
 class SignedTypeFixer:
+    # 整数リテラルのパターン (数値部分と接尾子を分離するため)
+    _INTEGER_LITERAL_PATTERN = r'^(0x[0-9A-Fa-f]+|[0-9]+)[uUlL]*$'
+    
     def __init__(self, src_file="example.c", compile_args=None, macro_table=None, type_table=None):
         self.src_file = src_file
         self.compile_args = compile_args or ["-std=c11", "-Iinclude"]
@@ -323,10 +326,12 @@ class SignedTypeFixer:
 
                 # リテラルの場合は既に U サフィックスがあるか確認して不要ならスキップ
                 if self._is_integer_literal_token(target_name):
+                    # リテラルから接尾子を除いた数値部分を取得
+                    literal_base = self._strip_literal_suffix(target_name)
                     # もし変換先が unsigned で既に U が付いているなら不要
-                    if self._is_unsigned(new_type) and self._literal_has_unsigned_suffix(new_line_text, target_name):
+                    if self._is_unsigned(new_type) and self._literal_has_unsigned_suffix(new_line_text, literal_base):
                         continue
-                    new_line_text, did = self._replace_literal_with_toggled(new_line_text, target_name, new_type)
+                    new_line_text, did = self._replace_literal_with_toggled(new_line_text, literal_base, new_type)
                 else:
                     new_line_text, did = self._replace_var_with_cast(new_line_text, target_name, new_type)
 
@@ -345,7 +350,19 @@ class SignedTypeFixer:
         if not token:
             return False
         # 10進、16進、接尾子(u,l) を許容
-        return bool(re.match(r'^(0x[0-9A-Fa-f]+|[0-9]+)[uUlL]*$', token))
+        return bool(re.match(self._INTEGER_LITERAL_PATTERN, token))
+
+    def _strip_literal_suffix(self, token: str) -> str:
+        """
+        整数リテラルから接尾子 (u/U/l/L) を取り除いて数値部分のみを返す。
+        例: "3U" -> "3", "0x10UL" -> "0x10", "42" -> "42"
+        """
+        if not token:
+            return token
+        m = re.match(self._INTEGER_LITERAL_PATTERN, token)
+        if m:
+            return m.group(1)
+        return token
 
     def _replace_literal_with_toggled(self, line: str, token: str, new_type: str):
         """
