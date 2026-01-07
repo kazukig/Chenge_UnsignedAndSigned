@@ -365,23 +365,17 @@ class SignedTypeFixer:
             base_num_match = re.match(r'^(0x[0-9A-Fa-f]+|[0-9]+)([uUlL]*)$', token)
             if base_num_match:
                 # ベース数値部分だけを使用してパターンを構築
+                # パターンは一貫性のため、ベース数値とサフィックスの両方をキャプチャ
                 base_num = base_num_match.group(1)
-                # コード中のベース数値にマッチし、その後の接尾子を捕捉
-                pat = r'(?<![\w_])' + re.escape(base_num) + r'([uUlL]*)(?![\w_])'
-                use_base_only = True
+                pat = r'(?<![\w_])(' + re.escape(base_num) + r')([uUlL]*)(?![\w_])'
             else:
                 # トークンが通常の形式でない場合は従来通り
                 pat = r'(?<![\w_])(' + re.escape(token) + r')([uUlL]*)' + r'(?![\w_])'
-                use_base_only = False
 
             def repl(m):
-                if use_base_only:
-                    # ベース数値とサフィックスを分離して処理
-                    lit = base_num
-                    suffix = m.group(1) or ""
-                else:
-                    lit = m.group(1)
-                    suffix = m.group(2) or ""
+                # 両方のブランチで一貫してマッチグループを使用
+                lit = m.group(1)
+                suffix = m.group(2) or ""
                 # normalize suffix letters except keep L's
                 has_Ls = "".join([c for c in suffix if c.lower() == 'l'])
                 if make_unsigned:
