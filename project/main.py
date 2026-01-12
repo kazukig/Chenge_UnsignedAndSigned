@@ -11,6 +11,7 @@ from analyzer.CodeAnalyzer import CodeAnalyzer
 from fixer.SignedTypeFixer import SignedTypeFixer
 from analyzer.MacroTable import MacroTable
 from analyzer.TypeTable import TypeTable
+from analyzer.FunctionTable import FunctionTable
 
 
 class CommitManager:
@@ -37,12 +38,13 @@ class CommitManager:
             pass
         return 1
 
-    def makeOutputFile(self, input_path: str, output_path: str, res) -> bool:
+    def makeOutputFile(self, input_path: str, output_path: str, ln: int, txt: str) -> bool:
         """
-        入力パスのファイルをコピーし、res に従って該当行を置換して出力パスに書き出す。
-        res: [指摘番号, 行番号, 成功フラグ, 修正後の行文字列]
-        入力と出力が同一パスなら上書きする。
-        成功時 True, 失敗時 False を返す。
+        入力パスのファイルをコピーし、ln(1始まり行番号) の行を txt に置換して出力する。
+
+        追加仕様:
+          置換対象行(lines[ln-1])の先頭にあるインデント（空白/タブ）を維持する。
+          txt の先頭にも同じインデントを付けて、変更前後で先頭位置が揃うようにする。
         """
         try:
             with open(input_path, 'r', encoding='utf-8', errors='ignore') as rf:
@@ -50,26 +52,31 @@ class CommitManager:
         except Exception:
             return False
 
-        # デフォルトはコピーのみ
         new_lines = list(lines)
 
         try:
-            if isinstance(res, (list, tuple)) and len(res) >= 4:
+            if txt is not None and ln is not None:
+                ln = int(ln)
+                if ln < 1 or ln > len(new_lines):
+                    return False
+
+                # 追加: 元行の先頭インデント（空白/タブ）を抽出して txt に付与
                 try:
-                    ln = int(res[1])
+                    before = new_lines[ln - 1]
+                    indent = re.match(r'^[ \t]*', before).group(0)
                 except Exception:
-                    ln = None
-                ok = bool(res[2])
-                new_line_text = res[3] if res[3] is not None else ""
-                if ok and ln and 1 <= ln <= len(new_lines):
-                    # Ensure newline at end
-                    if not new_line_text.endswith("\n"):
-                        new_line_text = new_line_text + "\n"
-                    new_lines[ln - 1] = new_line_text
+                    indent = ""
+
+                # txt 側の先頭インデントは一旦落としてから、元のindentを付ける
+                txt_norm = txt.lstrip(' \t')
+                txt = indent + txt_norm
+
+                if not txt.endswith("\n"):
+                    txt = txt + "\n"
+                new_lines[ln - 1] = txt
         except Exception:
             return False
 
-        # 出力先ディレクトリ作成
         out_dir = os.path.dirname(output_path) or "."
         try:
             os.makedirs(out_dir, exist_ok=True)
@@ -82,6 +89,7 @@ class CommitManager:
             return True
         except Exception:
             return False
+        return False
 
     def perform(self, commit_flag: str, result, src_path: str, message=None):
         """
@@ -158,6 +166,118 @@ class CommitManager:
         except Exception as e:
             return {"ok": False, "reason": f"write result.json failed: {e}"}
 
+def toText(func_table, res):
+    """
+    引数:
+      (1) func_table: FunctionTable クラスの変数（getFunctionInfo(name) を持つ）
+      (2) res: 197行目のresの返り値（例: [{'type':..., 'text':...}, ...]）
+
+    返り値:
+      text(str)
+
+    仕様:
+      base = res[0]["text"] を走査し、スペース区切りのトークンのうち
+      - 単語
+      - もしくは '(type)func' のようなキャスト付きトークン（直前に ')' がある）
+      を「関数名候補」として判定する。
+
+      関数テーブルに存在したら（getFunctionInfoで判定）、
+      その関数の引数数だけ res[1]["text"], res[2]["text"] ... を後ろに追加していく。
+    """
+    if not res or not isinstance(res, list):
+        return ""
+    if not isinstance(res[0], dict) or "text" not in res[0]:
+        return ""
+
+    base = (res[0].get("text") or "").strip()
+    tokens = base.split()
+
+    add_idx = 1  # resの引数式の消費位置
+
+    def _extract_func_name(tok: str) -> str:
+        t = tok.strip()
+        t = re.sub(r'[;,]+$', '', t)
+
+        # "(type)name" 形式
+        m = re.match(r'^\([^)]*\)\s*([A-Za-z_]\w*)', t)
+        if m:
+            return m.group(1)
+
+        # "name(" 形式
+        m = re.match(r'^([A-Za-z_]\w*)\s*\(', t)
+        if m:
+            return m.group(1)
+
+        # 単語そのもの
+        if re.fullmatch(r'[A-Za-z_]\w*', t):
+            return t
+
+        return ""
+
+    out_tokens = []
+    for tok in tokens:
+        fname = _extract_func_name(tok)
+        if not fname:
+            out_tokens.append(tok)
+            continue
+
+        try:
+            info = func_table.getFunctionInfo(fname)
+        except Exception:
+            info = []
+
+        # 関数表に無いならそのまま
+        if not info or not isinstance(info, dict):
+            out_tokens.append(tok)
+            continue
+
+        # 引数数
+        try:
+            argc = int(info.get("argc", 0) or 0)
+        except Exception:
+            argc = 0
+
+        # 引数テキストを集める（res[1]..から消費）
+        args_text = []
+        for _ in range(argc):
+            if add_idx >= len(res):
+                break
+            item = res[add_idx]
+            add_idx += 1
+            if not isinstance(item, dict):
+                continue
+            a = (item.get("text") or "").strip()
+            if a:
+                args_text.append(a)
+
+        # 置換: 関数名(...)  ※必ず括弧を付ける
+        call_txt = f"{fname}({', '.join(args_text)})"
+
+        # tok が "(int)fname" や "fname(" 等を含む場合もあるので、そこだけ置換して形を崩さない
+        # 置換できなければ call_txt をそのまま入れる
+        try:
+            pos = tok.find(fname)
+            if pos >= 0:
+                replaced = tok[:pos] + call_txt + tok[pos + len(fname):]
+                # "fname(" だった場合に "(...)" が二重になり得るので、余計な "(" を軽く除去
+                replaced = re.sub(rf'\b{re.escape(fname)}\({re.escape(", ".join(args_text))}\)\(', call_txt, replaced)
+                out_tokens.append(replaced)
+            else:
+                out_tokens.append(call_txt)
+        except Exception:
+            out_tokens.append(call_txt)
+
+    out = " ".join(out_tokens)
+
+    # 末尾の空白を削除
+    out = out.rstrip()
+
+    # 末尾に ";" を追加（既に付いていなければ）
+    if out and not out.endswith(";"):
+        out += ";"
+
+    return out
+
 if __name__ == "__main__":
     src = "../test_kaizen/example.c"
     args = ["-std=c11", "-Iinclude"]
@@ -167,23 +287,41 @@ if __name__ == "__main__":
     ttab = TypeTable(src_file=src, compile_args=args).make()
 
     # コミット/JSON 出力は CommitManager に委譲する
-    mgr = CommitManager(repo_path='../test_kaizen', user_name='kazukig', user_email='mannen5656@gmail.com', token="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")
-
-    analyzer = CodeAnalyzer(src_file=src, compile_args=args)
-    x = analyzer.run()
+    mgr = CommitManager(repo_path='../test_kaizen', user_name='kazukig', user_email='mannen5656@gmail.com', token="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")
     
     #指摘表([指摘番号,行番号])
-    chlist = [[0,56], [0,66],[0,72]]
+    chlist = [[0,103]]
     for coords in chlist:
+        
+        print("--------------------------[ Analyze Start ] --------------------------")
+        #srcファイルを解析して指定行の指摘をキャスト用解析のjsonフォーマットにコンパイルする。
+        analyzer = CodeAnalyzer(src_file=src, compile_args=args, check_list=coords[1])
+        x = analyzer.compile()
+
+        #[TBD] 以下でとりあえず関数テーブルを作成したが不必要なものも多い。
+        ft = FunctionTable(tu=analyzer.getTu(), srcfile=src, preproc_map=analyzer.getpreprocmap())
+        ft.make()  # これを追加（関数テーブルを構築して self.data に入れる）
+        print(x)
+        print("--------------------------[ Analyze Finish ] --------------------------")
+
+
+        print("--------------------------[ Cast Start ] --------------------------")
         # SignedTypeFixer にテーブルを渡す
         fixer = SignedTypeFixer(src_file=src, compile_args=args, macro_table=None, type_table=ttab)
         # 例: 指摘番号 0, 行 157 を処理
-        res = fixer.solveSignedTypedConflict(x, coords)
+        res = fixer.solveSignedTypedConflict(x)
         print("修正結果:", res)
 
+        #テキスト変換
+        txt = toText(ft,res)
+        print("変換結果:", txt)
+        print("--------------------------[ Cast Finish ] --------------------------")
+
         # ここで出力ファイルを生成（入力=出力で上書き）
-        wrote = mgr.makeOutputFile(src, src, res)
+        wrote = mgr.makeOutputFile(src, src, coords[1], txt)
         print("makeOutputFile wrote:", wrote)
+
+        exit(1)
 
         # ファイル化ができたら perform を呼び出し、res を commit message として渡す
         if wrote:

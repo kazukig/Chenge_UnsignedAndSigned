@@ -1,396 +1,356 @@
-import os
-import re
-import sys
-import subprocess
-import tempfile
 from typing import Optional
 from clang import cindex
+import re
 
-# 新しいクラス: 署名付き/非署名の衝突を解決するための修正器
+DEF_DEBUG=True
+
 class SignedTypeFixer:
     def __init__(self, src_file="example.c", compile_args=None, macro_table=None, type_table=None):
         self.src_file = src_file
         self.compile_args = compile_args or ["-std=c11", "-Iinclude"]
-        # マクロ表と型表を private に保持
-        self._macro_table = macro_table or []
-        self._type_table = type_table or    []
+        self._type_table = type_table or []
 
-    def _resolve_type(self, type_str: str) -> str:
-        """
-        typedef テーブルを使って与えられた型記述を再帰的に展開する。
-        self._type_table の各要素は [alias, actual, rels, [file, [lines...]]] という形を想定。
-        深さ制限を入れて無限ループを防ぐ。
-        """
-        if not type_str:
-            return type_str
-
-        # type_table を辞書化(alias -> actual)
-        type_map = {}
+        # TypeTable: [ [alias, actual, related, [file,[lines...]]], ... ]
+        self._type_map = {}
         try:
-            for entry in self._type_table:
-                if isinstance(entry, (list, tuple)) and len(entry) >= 2:
-                    alias = str(entry[0])
-                    actual = str(entry[1]) if entry[1] is not None else ""
-                    type_map[alias] = actual
+            for row in self._type_table:
+                if isinstance(row, (list, tuple)) and len(row) >= 2:
+                    self._type_map[str(row[0]).strip()] = str(row[1]).strip()
         except Exception:
-            return type_str
-
-        token_re = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\b')
-
-        sys.setrecursionlimit(max(1000, sys.getrecursionlimit()))
-
-        def resolve_token(tok: str, seen: set, depth: int) -> str:
-            if depth > 50:
-                return tok
-            if tok in seen:
-                return tok
-            if tok in type_map and type_map[tok] and type_map[tok] != tok:
-                seen.add(tok)
-                base = type_map[tok]
-                return token_re.sub(lambda m: resolve_token(m.group(1), seen.copy(), depth + 1), base)
-            return tok
-
-        try:
-            resolved = token_re.sub(lambda m: resolve_token(m.group(1), set(), 0), type_str)
-            return " ".join(resolved.split())
-        except Exception:
-            return type_str
+            self._type_map = {}
 
     def _actual_type_from_typetable(self, type_str: str) -> str:
-        """
-        self._type_table のエントリ [alias, actual, ...] を参照して
-        alias -> actual のマッピングを返す。見つからなければ _resolve_type を返す。
-        """
         if not type_str:
-            return type_str
-        try:
-            # normalize token (use first token as alias lookup)
-            first_tok = re.match(r'\b([A-Za-z_][A-Za-z0-9_]*)\b', type_str)
-            key = first_tok.group(1) if first_tok else type_str
-            for entry in self._type_table:
-                if isinstance(entry, (list, tuple)) and len(entry) >= 2:
-                    alias = str(entry[0])
-                    actual = str(entry[1]) if entry[1] is not None else ""
-                    if alias == key:
-                        return actual or self._resolve_type(type_str)
-        except Exception:
-            pass
-        return self._resolve_type(type_str)
+            return ""
+        s = " ".join(str(type_str).split())
+        token_re = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\b')
 
-    def _is_unsigned(self, type_str: str) -> bool:
-        try:
-            if not type_str:
-                return False
-            s = self._resolve_type(type_str).replace("const", "").replace("volatile", "").strip().lower()
+        def repl(m):
+            tok = m.group(1)
+            return self._type_map.get(tok, tok)
+
+        prev = None
+        cur = s
+        for _ in range(20):
+            if cur == prev:
+                break
+            prev = cur
+            cur = token_re.sub(repl, cur)
+            cur = " ".join(cur.split())
+        return cur
+
+    def _normalize_actual_type(self, type_str: str) -> str:
+        return self._actual_type_from_typetable(type_str) or (type_str or "").strip()
+
+    def _is_integer_type(self, actual_type: str) -> bool:
+        s = (actual_type or "")
+        s = re.sub(r'\b(const|volatile)\b', '', s)
+        s = " ".join(s.split())
+
+        if s in (
+            "bool",
+            "char", "signed char", "unsigned char",
+            "int", "signed", "unsigned", "unsigned int",
+            "int8_t", "int16_t", "int32_t", "int64_t",
+            "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+        ):
+            return True
+
+        # ざっくり *_t の整数型も許可
+        if s.endswith("_t") and ("int" in s or "uint" in s):
+            return True
+        return False
+
+    def _is_unsigned(self, actual_type: str) -> bool:
+        s = (actual_type or "")
+        s = re.sub(r'\b(const|volatile)\b', '', s)
+        s = " ".join(s.split())
+
+        if s.startswith("unsigned"):
+            return True
+        if s in ("uint8_t", "uint16_t", "uint32_t", "uint64_t", "unsigned char"):
+            return True
+        # char は処理系依存なので unsigned 扱いにしない
+        return False
+
+    def _is_integer_literal_token(self, txt: str) -> bool:
+        s = (txt or "").strip()
+        return bool(re.fullmatch(r'(0[xX][0-9A-Fa-f]+|0[0-7]*|[0-9]+)([uUlL]{0,3})', s))
+
+    def _toggle_unsigned_literal_suffix(self, txt: str, make_unsigned: bool) -> str:
+        s = (txt or "").strip()
+        m = re.fullmatch(r'(?P<num>0[xX][0-9A-Fa-f]+|0[0-7]*|[0-9]+)(?P<suf>[uUlL]{0,3})', s)
+        if not m:
+            return s
+        num = m.group("num")
+        suf = m.group("suf") or ""
+
+        if make_unsigned:
+            if "U" in suf.upper():
+                return num + suf.replace("u", "U")
+            # Uを追加（Lは維持）
+            return num + "U" + "".join([c for c in suf if c not in ("u", "U")])
+        else:
+            # U/u だけ除去（Lは残す）
+            return num + "".join([c for c in suf if c not in ("u", "U")])
+
+    def solveSignedTypedConflict(self, run_result):
+        """
+        引数:
+          run_result: {operator,A,B,type,text,kakko} node を root に持つ木構造のリスト
+
+        返り値:
+          ボトムアップ処理後の木構造リスト。
+          最終的には各要素が leaf: {"type":..., "text":...} になる（= 1つの式に縮約）。
+
+        処理(ボトムアップ):
+          (1) 末端node(A,Bがleaf)をワークから探す
+          (2) A/Bどちらをキャストするか決める（定数優先、両変数ならB）
+          (3) キャスト先型を決める（相手の type 表記）
+          (4) キャストを leaf.text に反映し、node を {type,text} に縮約
+          (5) 結果リスト(work自体)を更新
+        """
+        if not run_result or not isinstance(run_result, list):
+            return run_result
+
+        import copy
+        work = copy.deepcopy(run_result)
+
+        def _is_node(n) -> bool:
+            return isinstance(n, dict) and "operator" in n and "A" in n and "B" in n
+
+        def _is_leaf(n) -> bool:
+            return isinstance(n, dict) and "operator" not in n and "type" in n and "text" in n
+
+        def _wrap_once(s: str) -> str:
+            """
+            既に「式全体」が最外の () で1組に包まれているならそのまま。
+            そうでなければ ( ... ) を付与する。
+
+            例:
+              "(a+b)"        -> そのまま
+              "(a+b)+c"      -> "((a+b)+c)"  （先頭'('が途中で閉じる）
+              "(b-4)%(2+c)"  -> "((b-4)%(2+c))"（複合）
+              "a"            -> "(a)"
+            """
+            s = (s or "").strip()
+            if not s:
+                return s
+
+            # まず先頭/末尾が括弧でないなら付与
+            if not (s.startswith("(") and s.endswith(")")):
+                return f"({s})"
+
+            # 先頭 '(' が末尾 ')' とペアになって「全体」を包んでいるかチェック
+            depth = 0
+            first_pair_closes_at = None
+            for i, ch in enumerate(s):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        first_pair_closes_at = i
+                        break
+
+            # パースできない/途中で閉じた → 全体を包む括弧ではないので追加
+            if first_pair_closes_at is None:
+                return f"({s})"
+
+            # 先頭の '(' が末尾の ')' で閉じている（=最外が全体を包む）なら追加しない
+            if first_pair_closes_at == len(s) - 1:
+                return s
+
+            # 途中で閉じた（= "(...)+..." や "(... )%( ... )" など複合）→ 追加
+            return f"({s})"
+
+        def _needs_wrap_for_cast(txt: str) -> bool:
+            s = (txt or "").strip()
             if not s:
                 return False
-            if "unsigned" in s.split():
-                return True
-            if re.match(r'^uint\d+(_t)?\b', s):
-                return True
-            return False
-        except Exception:
-            return False
-
-    def _toggle_type(self, type_str: str) -> str:
-        """
-        unsigned 型を対応する signed 型へ簡易変換する。
-        完全網羅ではないが一般的なパターンに対応する。
-        """
-        try:
-            if not type_str:
-                return type_str
-            s = self._resolve_type(type_str).strip()
-            low = s.lower()
-
-            mapping = {
-                "uint8_t": "int8_t",
-                "uint16_t": "int16_t",
-                "uint32_t": "int32_t",
-                "uint64_t": "int64_t",
-                "unsigned char": "signed char",
-                "unsigned short": "short",
-                "unsigned long long": "long long",
-                "unsigned long": "long",
-                "unsigned int": "int",
-                "unsigned": "int",
-            }
-            for k, v in mapping.items():
-                if low.startswith(k):
-                    # preserve any trailing qualifiers (e.g. " const")
-                    return v + s[len(k):]
-
-            m = re.match(r'^(u?int)(\d+)(_t)?', low)
-            if m:
-                bits = m.group(2)
-                return f"int{bits}_t"
-
-            # 最終手段: 'unsigned' を取り除く
-            if "unsigned" in s:
-                return " ".join([tok for tok in s.split() if tok.lower() != "unsigned"])
-
-            return s
-        except Exception:
-            return type_str
-
-    def _is_integer_type(self, type_str: str) -> bool:
-        """整数系の型かどうかを判定する（intN_t / uintN_t / int / short / long / char 等）。"""
-        if not type_str:
-            return False
-        s = self._resolve_type(type_str).lower()
-        return bool(re.search(r'\b(?:u?int\d+_t|int|short|long|char|signed char|unsigned char|unsigned int|unsigned)\b', s))
-
-    def _type_bitwidth(self, type_str: str):
-        """
-        型文字列からビット幅を推定する。推定できなければ None を返す。
-        """
-        if not type_str:
-            return None
-        s = self._resolve_type(type_str).lower()
-        m = re.search(r'u?int(\d+)_t', s)
-        if m:
-            try:
-                return int(m.group(1))
-            except Exception:
-                pass
-        if re.search(r'\bchar\b', s):
-            return 8
-        if re.search(r'\bshort\b', s):
-            return 16
-        if re.search(r'\blong long\b', s) or re.search(r'longlong', s):
-            return 64
-        if re.search(r'\blong\b', s):
-            # assume 64 for LP64 platforms; if unknown, return None could be safer
-            return 64
-        if re.search(r'\bint\b', s):
-            return 32
-        return None
-
-    def _extract_cast_type_for_var(self, line: str, varname: str) -> Optional[str]:
-        """
-        行内で varname の直前にあるキャスト (TYPE)varname を探し、
-        見つかれば TYPE の文字列を返す。見つからなければ None を返す。
-        """
-        try:
-            # capture TYPE in "( TYPE ) varname" allowing spaces and simple qualifiers
-            pat = re.compile(r'\(\s*([A-Za-z_][A-Za-z0-9_ \t\*]*)\s*\)\s*' + re.escape(varname))
-            m = pat.search(line)
-            if m:
-                return m.group(1).strip()
-        except Exception:
-            pass
-        return None
-
-    def _var_has_cast_of_sign(self, line: str, varname: str, desired_unsigned: bool) -> bool:
-        """
-        varname に対して既にキャストがあり、そのキャスト型の符号性が
-        desired_unsigned と一致していれば True を返す。
-        """
-        try:
-            cast_type = self._extract_cast_type_for_var(line, varname)
-            if not cast_type:
+            if s.startswith("(") and s.endswith(")"):
                 return False
-            resolved = self._actual_type_from_typetable(cast_type) or self._resolve_type(cast_type)
-            return self._is_unsigned(resolved) == bool(desired_unsigned)
-        except Exception:
-            return False
+            return bool(re.search(r'[\s\+\-\*/%<>=&|^]', s))
 
-    def _literal_has_unsigned_suffix(self, line: str, token: str) -> bool:
-        try:
-            pat = re.compile(r'(?<![\w_])' + re.escape(token) + r'([uU][lL]*)' + r'(?![\w_])')
-            return bool(pat.search(line))
-        except Exception:
-            return False
+        def _prec(op: str) -> int:
+            if op == "=":
+                return 1
+            if op in ("||",):
+                return 2
+            if op in ("&&",):
+                return 3
+            if op in ("==", "!=", "<=", ">=", "<", ">"):
+                return 4
+            if op in ("<<", ">>"):
+                return 5
+            if op in ("+", "-"):
+                return 6
+            if op in ("*", "/", "%"):
+                return 7
+            return 10
 
-    def solveSignedTypedConflict(self, run_result, line_pair):
-        """
-        変更:
-        - line_pair は [指摘番号, 行番号] のみ（単一）。
-        - 戻り値は [指摘番号, 行番号, 成功フラグ, 修正後の行または None]
-        - 型比較には self._type_table を参照し、実際の型同士で符号性を判定する。
-        - 変換が必要な場合は「相手の型に合わせて」キャストを行う。
-        """
-        try:
-            # 基本バリデーション
-            if run_result == -1 or not isinstance(run_result, list):
-                return [line_pair[0], line_pair[1], False, None]
+        def _assoc(op: str) -> str:
+            return "right" if op == "=" else "left"
 
-            if not isinstance(line_pair, (list, tuple)) or len(line_pair) < 2:
-                return [None, None, False, None]
-            idx_id, ln = line_pair[0], int(line_pair[1])
+        def _is_associative(op: str) -> bool:
+            return op in ("+", "*", "&&", "||")
 
-            # 元ソースを読み込む
-            with open(self.src_file, 'r', encoding='utf-8', errors='ignore') as f:
-                original_lines = f.readlines()
+        def _needs_paren(child, parent_op: str, is_right_child: bool) -> bool:
+            if not _is_node(child):
+                return False
+            cop = (child.get("operator") or "").strip()
+            pop = (parent_op or "").strip()
+            if not pop:
+                return False
+            cp, pp = _prec(cop), _prec(pop)
+            if cp < pp:
+                return True
+            if cp > pp:
+                return False
+            if _assoc(pop) == "right":
+                return not is_right_child
+            if _assoc(pop) == "left" and pop in ("-", "/", "%", "<<", ">>"):
+                return is_right_child
+            if _is_associative(pop) and cop == pop:
+                return False
+            return True
 
-            if ln <= 0 or ln > len(original_lines):
-                return [idx_id, ln, False, None]
+        def _to_expr(n, parent_op: str = "", is_right_child: bool = False) -> str:
+            if _is_leaf(n):
+                return (n.get("text") or "").strip()
+            if not _is_node(n):
+                return str(n)
 
-            # ルックアップ用: 行番号 -> エントリのリスト
-            line_map = {}
-            for e in run_result:
-                try:
-                    lno = int(e.get('line', -1))
-                except Exception:
-                    lno = -1
-                if lno >= 0:
-                    line_map.setdefault(lno, []).append(e)
+            op = (n.get("operator") or "").strip()
+            A = n.get("A")
+            B = n.get("B")
+            left = _to_expr(A, op, False)
+            right = _to_expr(B, op, True)
 
-            entries = line_map.get(ln, [])
-            if not entries:
-                return [idx_id, ln, False, None]
+            if _needs_paren(A, op, False):
+                left = _wrap_once(left)
+            if _needs_paren(B, op, True):
+                right = _wrap_once(right)
 
-            # ワーキングコピー
-            working_lines = original_lines[:]
-            line_idx = ln - 1
-            original_line_text = working_lines[line_idx]
-            new_line_text = original_line_text
+            expr = f"{left} {op} {right} "
 
-            # 各エントリに対して逐次的に修正
-            for ent in entries:
-                A_type = ent.get('A_type', '') or ''
-                B_type = ent.get('B_type', '') or ''
-                A_name = ent.get('A_name', '') or ''
-                B_name = ent.get('B_name', '') or ''
+            if parent_op and _needs_paren(n, parent_op, is_right_child):
+                expr = _wrap_once(expr)
 
-                # 実際の型を型テーブルから取得（無ければ _resolve_type で展開）
-                resolved_A = self._resolve_type(A_type)
-                resolved_B = self._resolve_type(B_type)
-                actual_A = self._actual_type_from_typetable(A_type) or resolved_A
-                actual_B = self._actual_type_from_typetable(B_type) or resolved_B
+            if bool(n.get("kakko")):
+                expr = _wrap_once(expr)
 
-                target_name = None
-                new_type = None
+            return expr
 
-                # まず、行内で既に (TYPE)var のようなキャストがある場合はそれを優先して実際の型とする
-                if A_name:
-                    castA = self._extract_cast_type_for_var(original_line_text, A_name)
-                    if castA:
-                        actual_castA = self._actual_type_from_typetable(castA) or self._resolve_type(castA)
-                        if actual_castA:
-                            actual_A = actual_castA
-                if B_name:
-                    castB = self._extract_cast_type_for_var(original_line_text, B_name)
-                    if castB:
-                        actual_castB = self._actual_type_from_typetable(castB) or self._resolve_type(castB)
-                        if actual_castB:
-                            actual_B = actual_castB
+        # (1) 末端 node を探す（深い側優先）
+        def _find_bottom_node(root):
+            if not _is_node(root):
+                return None
+            A = root.get("A")
+            B = root.get("B")
+            if _is_node(A):
+                t = _find_bottom_node(A)
+                if t is not None:
+                    return t
+            if _is_node(B):
+                t = _find_bottom_node(B)
+                if t is not None:
+                    return t
+            if _is_leaf(A) and _is_leaf(B):
+                return root
+            return None
 
-                # 符号性の判定は実際の型に対して行う
-                try:
-                    sigA = self._is_unsigned(actual_A)
-                    sigB = self._is_unsigned(actual_B)
-                except Exception:
-                    sigA = self._is_unsigned(resolved_A)
-                    sigB = self._is_unsigned(resolved_B)
+        # (2) キャスト対象の決定
+        def _choose_cast_side(node) -> str:
+            A = node["A"]
+            B = node["B"]
+            a_const = self._is_integer_literal_token(A.get("text", ""))
+            b_const = self._is_integer_literal_token(B.get("text", ""))
+            if a_const and b_const:
+                return "B"
+            if a_const:
+                return "A"
+            if b_const:
+                return "B"
+            return "B"
 
-                # サイズが異なるだけの組み合わせは変換対象から除外する
-                try:
-                    if self._is_integer_type(actual_A) and self._is_integer_type(actual_B):
-                        wA = self._type_bitwidth(actual_A)
-                        wB = self._type_bitwidth(actual_B)
-                        if wA is not None and wB is not None and wA != wB:
-                            # ビット幅が異なればキャスト対象外（例: uint8_t vs uint32_t）
-                            # - 同じ符号性（両方 unsigned または両方 signed）なら除外
-                            # - 符号性が異なれば変換対象とする（continue しない）
-                            if sigA == sigB:
-                                continue
-                except Exception:
-                    pass
+        # (3) キャスト先型
+        def _decide_cast_type(node, cast_side: str) -> str:
+            if cast_side == "A":
+                return node["B"].get("type", "x")
+            return node["A"].get("type", "x")
 
-                # もし既に行内キャストで符号合わせがされているなら処理不要
-                if B_name and self._extract_cast_type_for_var(original_line_text, B_name):
-                    # B に対するキャストがあり、そのキャストの符号性が A に合わせられていればスキップ
-                    if self._var_has_cast_of_sign(original_line_text, B_name, sigA):
-                        continue
-                if A_name and self._extract_cast_type_for_var(original_line_text, A_name):
-                    if self._var_has_cast_of_sign(original_line_text, A_name, sigB):
-                        continue
+        def _is_mismatch(a_type: str, b_type: str) -> bool:
+            at = self._normalize_actual_type(a_type)
+            bt = self._normalize_actual_type(b_type)
+            if not self._is_integer_type(at) or not self._is_integer_type(bt):
+                return False
+            return self._is_unsigned(at) != self._is_unsigned(bt)
 
-                if B_name:
-                    if sigA != sigB:
-                        # B を A に合わせてキャストする (相手の型に合わせる)
-                        target_name = B_name
-                        new_type = actual_A if actual_A else resolved_A
-                if not target_name and A_name:
-                    if sigA != sigB:
-                        # A を B に合わせてキャストする
-                        target_name = A_name
-                        new_type = actual_B if actual_B else resolved_B
+        # (4) leaf.text 更新
+        def _apply_cast_to_leaf(leaf: dict, target_type: str) -> dict:
+            new_leaf = dict(leaf)
+            txt = (new_leaf.get("text") or "").strip()
 
-                if not target_name or not new_type:
-                    continue
-
-                # リテラルの場合は既に U サフィックスがあるか確認して不要ならスキップ
-                if self._is_integer_literal_token(target_name):
-                    # もし変換先が unsigned で既に U が付いているなら不要
-                    if self._is_unsigned(new_type) and self._literal_has_unsigned_suffix(new_line_text, target_name):
-                        continue
-                    new_line_text, did = self._replace_literal_with_toggled(new_line_text, target_name, new_type)
+            if self._is_integer_literal_token(txt):
+                make_unsigned = self._is_unsigned(self._normalize_actual_type(target_type))
+                new_leaf["text"] = self._toggle_unsigned_literal_suffix(txt, make_unsigned)
+            else:
+                if _needs_wrap_for_cast(txt):
+                    new_leaf["text"] = f"({target_type}){_wrap_once(txt)}"
                 else:
-                    new_line_text, did = self._replace_var_with_cast(new_line_text, target_name, new_type)
+                    new_leaf["text"] = f"({target_type}){txt}"
 
-            # 変更がなければ失敗
-            if new_line_text == original_line_text:
-                return [idx_id, ln, False, None]
+            new_leaf["type"] = target_type
+            return new_leaf
 
-            # 成功（Git commit/push は呼び出し側で行う）
-            return [idx_id, ln, True, new_line_text]
-        except Exception:
-            return [line_pair[0] if isinstance(line_pair, (list, tuple)) and len(line_pair) > 0 else None,
-                    line_pair[1] if isinstance(line_pair, (list, tuple)) and len(line_pair) > 1 else None,
-                    False, None]
+        # 1要素(root)を完全にleafへ縮約
+        def _reduce_one(root):
+            guard = 0
+            while True:
+                guard += 1
+                if guard > 100000:
+                    break
 
-    def _is_integer_literal_token(self, token: str) -> bool:
-        if not token:
-            return False
-        # 10進、16進、接尾子(u,l) を許容
-        return bool(re.match(r'^(0x[0-9A-Fa-f]+|[0-9]+)[uUlL]*$', token))
+                if _is_leaf(root):
+                    return root
+                if not _is_node(root):
+                    # 想定外は文字列化してleaf化
+                    return {"type": "x", "text": str(root)}
 
-    def _replace_literal_with_toggled(self, line: str, token: str, new_type: str):
-        """
-        整数リテラル token を unsigned へ変換する場合は接尾子に U を追加、
-        signed へ変換する場合は接尾子の U を除去する。
-        例:
-          a + 4  --(to unsigned)--> a + 4U
-          a + 4U --(to signed)  --> a + 4
-        置換が起きた場合は (new_line, True) を返す。
-        """
-        try:
-            # 判定: 目的型が unsigned かどうか
-            make_unsigned = self._is_unsigned(new_type)
+                target = _find_bottom_node(root)
+                if target is None:
+                    # これ以上分解できないので丸ごと式化してleaf化
+                    return {"type": root.get("type", "x"), "text": _to_expr(root)}
 
-            # トークンに続く接尾子 (u/U/l/L の任意順) を捕捉
-            # 例マッチ: 4, 4U, 0x10U, 123ul
-            pat = r'(?<![\w_])(' + re.escape(token) + r')([uUlL]*)' + r'(?![\w_])'
+                A = target["A"]
+                B = target["B"]
+                if DEF_DEBUG: print("A = ", A)
+                if DEF_DEBUG: print("B = ", B)
 
-            def repl(m):
-                lit = m.group(1)
-                suffix = m.group(2) or ""
-                # normalize suffix letters except keep L's
-                has_Ls = "".join([c for c in suffix if c.lower() == 'l'])
-                if make_unsigned:
-                    # ensure a single uppercase U present (preserve Ls)
-                    new_suffix = has_Ls + "U"
+                if _is_mismatch(A.get("type"), B.get("type")):
+                    side = _choose_cast_side(target)
+                    if DEF_DEBUG:  print("side = ", side)
+                    cast_type = _decide_cast_type(target, side)
+                    if DEF_DEBUG:  print("cast_type = ", cast_type)
+                    if side == "A":
+                        target["A"] = _apply_cast_to_leaf(A, cast_type)
+                    else:
+                        target["B"] = _apply_cast_to_leaf(B, cast_type)
+                    target["type"] = cast_type
                 else:
-                    # remove any U/u, preserve Ls
-                    new_suffix = has_Ls
-                return lit + new_suffix
+                    target["type"] = target["A"].get("type", "x")
+                if DEF_DEBUG: print("A2 = ", target["A"])
+                if DEF_DEBUG: print("B2 = ", target["B"])
+                if DEF_DEBUG: print("target type = ", target["type"])
 
-            new_line, n = re.subn(pat, repl, line)
-            return new_line, n > 0
-        except Exception:
-            return line, False
+                # nodeをleafへ縮約（ボトムアップを進めるため必須）
+                if DEF_DEBUG: print("previous target = ", target)
+                target_leaf = {"type": target.get("type", "x"), "text": _to_expr(target)}
+                target.clear()
+                target.update(target_leaf)
 
-    def _replace_var_with_cast(self, line: str, varname: str, new_type: str):
-        """
-        変数名 varname の出現を ((new_type)varname) に置換する（簡易実装）。
-        必要ならより文脈に依存した処理に差し替えてください。
-        """
-        try:
-            pat = r'(?<![\w_])' + re.escape(varname) + r'(?![\w_])'
-            repl = f'({new_type}){varname}'
-            new_line, n = re.subn(pat, repl, line)
-            return new_line, n > 0
-        except Exception:
-            return line, False
+        for i in range(len(work)):
+            work[i] = _reduce_one(work[i])
+
+        return work

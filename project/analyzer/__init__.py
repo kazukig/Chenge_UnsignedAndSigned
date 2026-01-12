@@ -1,3 +1,4 @@
 from . import CodeAnalyzer
 from . import MacroTable
 from . import TypeTable
+from . import FunctionTable
