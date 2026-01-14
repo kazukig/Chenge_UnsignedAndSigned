@@ -166,23 +166,20 @@ class CommitManager:
         except Exception as e:
             return {"ok": False, "reason": f"write result.json failed: {e}"}
 
-def toText(func_table, res):
+def toText(func_table, res, spel=""):
     """
     引数:
       (1) func_table: FunctionTable クラスの変数（getFunctionInfo(name) を持つ）
       (2) res: 197行目のresの返り値（例: [{'type':..., 'text':...}, ...]）
+      (3) spel: analyzer 側で作った spelling（"if( @ )" 等。@ を含む想定）
 
     返り値:
       text(str)
 
     仕様:
-      base = res[0]["text"] を走査し、スペース区切りのトークンのうち
-      - 単語
-      - もしくは '(type)func' のようなキャスト付きトークン（直前に ')' がある）
-      を「関数名候補」として判定する。
-
-      関数テーブルに存在したら（getFunctionInfoで判定）、
-      その関数の引数数だけ res[1]["text"], res[2]["text"] ... を後ろに追加していく。
+      - まず従来通り out を生成する
+      - spel が空でない & '@' を含む場合、spel 内の '@' を out で置換した文字列を返す
+      - それ以外は out を返す
     """
     if not res or not isinstance(res, list):
         return ""
@@ -190,10 +187,15 @@ def toText(func_table, res):
         return ""
 
     base = (res[0].get("text") or "").strip()
-    tokens = base.split()
+
+    # 変更: 空白だけでなく、(){}[];,: など「関数の前後にありそうな文字」でも分割できるようにする
+    # 例: "if(a+b)" -> ["if", "(", "a+b", ")"]
+    # 例: "switch(func(x)){" -> ["switch", "(", "func", "(", "x", ")", ")", "{"]
+    tokens = [t for t in re.split(r'(\s+|[()\[\]{};,:])', base) if t and not t.isspace()]
 
     add_idx = 1  # resの引数式の消費位置
 
+    add_idx = 1  # resの引数式の消費位置
     def _extract_func_name(tok: str) -> str:
         t = tok.strip()
         t = re.sub(r'[;,]+$', '', t)
@@ -225,7 +227,6 @@ def toText(func_table, res):
             info = func_table.getFunctionInfo(fname)
         except Exception:
             info = []
-
         # 関数表に無いならそのまま
         if not info or not isinstance(info, dict):
             out_tokens.append(tok)
@@ -236,7 +237,6 @@ def toText(func_table, res):
             argc = int(info.get("argc", 0) or 0)
         except Exception:
             argc = 0
-
         # 引数テキストを集める（res[1]..から消費）
         args_text = []
         for _ in range(argc):
@@ -259,7 +259,6 @@ def toText(func_table, res):
             pos = tok.find(fname)
             if pos >= 0:
                 replaced = tok[:pos] + call_txt + tok[pos + len(fname):]
-                # "fname(" だった場合に "(...)" が二重になり得るので、余計な "(" を軽く除去
                 replaced = re.sub(rf'\b{re.escape(fname)}\({re.escape(", ".join(args_text))}\)\(', call_txt, replaced)
                 out_tokens.append(replaced)
             else:
@@ -269,12 +268,12 @@ def toText(func_table, res):
 
     out = " ".join(out_tokens)
 
-    # 末尾の空白を削除
-    out = out.rstrip()
-
-    # 末尾に ";" を追加（既に付いていなければ）
-    if out and not out.endswith(";"):
-        out += ";"
+    # 追加: spel の @ に out を挿入して返す
+    try:
+        if isinstance(spel, str) and spel and ("@" in spel):
+            return spel.replace("@", out, 1)
+    except Exception:
+        pass
 
     return out
 
@@ -297,11 +296,11 @@ if __name__ == "__main__":
         #srcファイルを解析して指定行の指摘をキャスト用解析のjsonフォーマットにコンパイルする。
         analyzer = CodeAnalyzer(src_file=src, compile_args=args, check_list=coords[1])
         x = analyzer.compile()
+        print("解析結果:", x)
 
         #[TBD] 以下でとりあえず関数テーブルを作成したが不必要なものも多い。
         ft = FunctionTable(tu=analyzer.getTu(), srcfile=src, preproc_map=analyzer.getpreprocmap())
-        ft.make()  # これを追加（関数テーブルを構築して self.data に入れる）
-        print(x)
+        print(ft.make())  # これを追加（関数テーブルを構築して self.data に入れる）
         print("--------------------------[ Analyze Finish ] --------------------------")
 
 
@@ -309,19 +308,20 @@ if __name__ == "__main__":
         # SignedTypeFixer にテーブルを渡す
         fixer = SignedTypeFixer(src_file=src, compile_args=args, macro_table=None, type_table=ttab)
         # 例: 指摘番号 0, 行 157 を処理
-        res = fixer.solveSignedTypedConflict(x)
+        res = fixer.solveSignedTypedConflict(x["trees"])
         print("修正結果:", res)
 
         #テキスト変換
-        txt = toText(ft,res)
+        print("--------------------------[ Cast Transform ] --------------------------")
+        print("x[\"spelling\"]:", x["spelling"])
+        txt = toText(ft,res,x["spelling"])
         print("変換結果:", txt)
         print("--------------------------[ Cast Finish ] --------------------------")
-
+        
         # ここで出力ファイルを生成（入力=出力で上書き）
         wrote = mgr.makeOutputFile(src, src, coords[1], txt)
         print("makeOutputFile wrote:", wrote)
 
-        exit(1)
 
         # ファイル化ができたら perform を呼び出し、res を commit message として渡す
         if wrote:

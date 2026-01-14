@@ -229,16 +229,26 @@ class CodeAnalyzer:
         """
         node 配下を再帰的に走査し、BINARY_OPERATOR の Cursor を収集する。
 
-        戻り値:
-          { orig_line(int): [Cursor, ...], ... }
+        返り値（変更後）:
+          {
+            orig_line(int): {
+              "line": orig_line,
+              "spelling": "<その行の文字列。抽出式部分は @ に置換>",
+              "cursors": [Cursor, Cursor, ...]
+            },
+            ...
+          }
 
-        追加仕様:
-          関数呼び出しの引数内にある式も「別式」として収集する。
-          例: a = func(c+d, e+f)
-            - 行全体の式: a=func(c+d,e+f)  （BINARY_OPERATOR: '='）
-            - 引数式1: c+d
-            - 引数式2: e+f
-          を同じ orig_line の child 要素として返す。
+        spelling 仕様:
+          (1) 基本は「元ソースのその行」。
+          (2) 抽出した式（ここで収集する cursor の token 範囲）に該当する部分を '@' に置き換える。
+              - cursor から 'return' 等を探して作らない
+              - あくまで「抽出した式の範囲」を行テキスト上で '@' 化する
+
+        例:
+          if(a + b)                -> "if(@)"
+          switch(func(a+b,5+c))    -> "switch(func(@,@))"
+          return (a + b)           -> "return @"
         """
         results = {}
         if node is None:
@@ -246,7 +256,7 @@ class CodeAnalyzer:
 
         allowed_line = self.check_list  # None ならフィルタしない
 
-        # (helper) preprocessed line -> orig_line
+        # --- helpers ---
         def _to_orig_line(cursor) -> int:
             try:
                 loc = getattr(cursor, "location", None)
@@ -258,7 +268,6 @@ class CodeAnalyzer:
             except Exception:
                 return 0
 
-        # (helper) subtree 内の BINARY_OPERATOR を列挙
         def _collect_binops_in_subtree(root_cursor):
             out = []
 
@@ -275,7 +284,6 @@ class CodeAnalyzer:
                 walk(root_cursor)
             return out
 
-        # (helper) build側で root を取れるように、argごとに extent 最大のBINARY_OPERATORを返す
         def _collect_arg_expr_roots(call_expr):
             roots = []
             try:
@@ -300,6 +308,168 @@ class CodeAnalyzer:
                     roots.append(binops[0])
             return roots
 
+        def _get_orig_line_text(orig_ln: int) -> str:
+            try:
+                with open(self.src_file, "r", errors="ignore") as f:
+                    lines = f.read().splitlines()
+                if 1 <= orig_ln <= len(lines):
+                    return lines[orig_ln - 1]
+            except Exception:
+                pass
+            return ""
+
+        def _cursor_to_line_span(cursor, orig_ln: int):
+            """
+            cursor の token を使い、orig_ln 行上での [start_col, end_col) を推定する。
+            - column は 1-based を想定
+            - end_col は「最後のトークン末尾の次」(exclusive)
+            失敗したら None を返す。
+            """
+            try:
+                if cursor is None:
+                    return None
+                toks = list(cursor.get_tokens())
+                if not toks:
+                    return None
+
+                line_toks = []
+                for t in toks:
+                    try:
+                        loc = getattr(t, "location", None)
+                        tl = int(getattr(loc, "line", 0) or 0) if loc else 0
+                        mapped = self.preproc_map.get(tl)
+                        t_orig_ln = int(mapped[1]) if mapped and len(mapped) >= 2 else tl
+                        if t_orig_ln == orig_ln:
+                            line_toks.append(t)
+                    except Exception:
+                        continue
+
+                if not line_toks:
+                    return None
+
+                first = line_toks[0]
+                last = line_toks[-1]
+
+                start_col = int(getattr(getattr(first, "location", None), "column", 0) or 0)
+                if start_col <= 0:
+                    return None
+
+                last_col = int(getattr(getattr(last, "location", None), "column", 0) or 0)
+                if last_col <= 0:
+                    return None
+
+                end_col = last_col + len(getattr(last, "spelling", "") or "")
+                if end_col <= start_col:
+                    return None
+
+                return (start_col - 1, end_col)
+            except Exception:
+                return None
+
+        def _make_spelling_by_replace(orig_ln: int, cursor_list):
+            """
+            orig_ln の行テキストに対し、cursor_list の範囲を '@' に置換して spelling を作る。
+            """
+            line_text = _get_orig_line_text(orig_ln)
+            if not line_text:
+                return ""
+
+            spans = []
+            for cur in cursor_list or []:
+                sp = _cursor_to_line_span(cur, orig_ln)
+                if sp is None:
+                    continue
+                s, e = sp
+                s = max(0, min(s, len(line_text)))
+                e = max(0, min(e, len(line_text)))
+                if e > s:
+                    spans.append((s, e))
+
+            if not spans:
+                return line_text.strip()
+
+            spans.sort(key=lambda x: (x[0], x[1]))
+            merged = []
+            for s, e in spans:
+                if not merged or s > merged[-1][1]:
+                    merged.append([s, e])
+                else:
+                    merged[-1][1] = max(merged[-1][1], e)
+
+            out = []
+            pos = 0
+            for s, e in merged:
+                out.append(line_text[pos:s])
+                out.append("@")
+                pos = e
+            out.append(line_text[pos:])
+
+            return "".join(out).strip()
+
+        def _canonicalize_spelling(orig_ln: int, cursor_list):
+            """
+            行頭のキーワードに応じて定型フォーマットへ正規化する。
+            - if    -> "if( @ )"   (+ 行末に "{" があれば "if( @ ){" )
+            - while -> "while( @ )" (+ 同上 )
+            - for   -> "for( @; @; @;)" (+ 行末に "{" があれば "for( @; @; @;){" )
+            - return-> "return @;"
+            - case  -> "case @:"
+            - break -> "break;"
+            それ以外は replace 方式の結果を返す。
+
+            追加仕様:
+              行が構文キーワード以外に「@ 以外の実体」を含まない場合は "@;" を返す。
+              例:
+                "@"        -> "@;"
+                "(@)"      -> "@;"
+                "@ + @;"   -> "@;"
+              ただし if/while/for/return/case/break などの構文行はこの規則より優先。
+            """
+            raw = _get_orig_line_text(orig_ln).strip()
+            if not raw:
+                return ""
+
+            # ブロック開始の "{" を末尾から検出（スペース類を挟んでもOK）
+            has_lbrace = bool(re.search(r'\{\s*$', raw))
+
+            # 行頭キーワード判定（case/break も追加）
+            m = re.match(r'^\s*(if|for|while|return|case|break)\b', raw)
+            if m:
+                kw = m.group(1)
+                if kw == "if":
+                    return "if( @ ){" if has_lbrace else "if( @ )"
+                if kw == "while":
+                    return "while( @ ){" if has_lbrace else "while( @ )"
+                if kw == "for":
+                    # ユーザ指定どおり末尾 ';' を含める（for( @; @; @;)）
+                    return "for( @; @; @;){" if has_lbrace else "for( @; @; @;)"
+                if kw == "return":
+                    return "return @;"
+                if kw == "case":
+                    return "case @:"
+                if kw == "break":
+                    return "break;"
+
+            # 構文行以外は、まず置換方式で作る
+            rep = _make_spelling_by_replace(orig_ln, cursor_list)
+
+            # 追加仕様:
+            # 置換後の文字列が「@ と区切り記号だけ」なら "@;" に落とす
+            # - @ の個数や位置は問わない
+            # - 構造的な識別子/数値/文字列/演算子が残っていないことを条件にする
+            #   例: "if(@)" は if があるので上で処理済み
+            #   例: "@ + @" は '+' があるので NG（=> "@;" にする）
+            #   ユーザ要望は「構文以外に何もない」ので、演算子も「何もない」に含めない（=> 演算子があれば @;）
+            if rep:
+                # 許可: 空白, @, 括弧, セミコロン, コロン, カンマ, ブレース
+                # これ以外が残る(英数字や演算子等)なら「何かある」
+                leftover = re.sub(r'[\s@()\[\]{};:,]', '', rep)
+                if leftover == "":
+                    return "@;"
+
+            return rep
+
+        # --- main walk ---
         for child in node.get_children():
             try:
                 orig_line = _to_orig_line(child)
@@ -309,32 +479,36 @@ class CodeAnalyzer:
                 if allowed_line is not None and orig_line != allowed_line:
                     raise Exception("filtered")
 
-                # (1) 行全体の式（BINARY_OPERATOR）は必ず追加（従来動作）
                 if child.kind == cindex.CursorKind.BINARY_OPERATOR:
-                    results.setdefault(orig_line, []).append(child)
+                    entry = results.setdefault(orig_line, {"line": orig_line, "spelling": "", "cursors": []})
+                    entry["cursors"].append(child)
 
-                    # (2) 追加: 行全体の式の中に CALL_EXPR があれば、その引数式も「別式」として追加
                     def walk_calls(n):
                         try:
                             for ch in n.get_children():
                                 if ch.kind == cindex.CursorKind.CALL_EXPR:
-                                    # 引数ごとに root を追加（c+d, e+f の root になる BINARY_OPERATOR）
                                     for r in _collect_arg_expr_roots(ch):
-                                        results.setdefault(orig_line, []).append(r)
+                                        entry2 = results.setdefault(orig_line, {"line": orig_line, "spelling": "", "cursors": []})
+                                        entry2["cursors"].append(r)
                                 walk_calls(ch)
                         except Exception:
                             return
 
                     walk_calls(child)
+
+                    entry["spelling"] = _canonicalize_spelling(orig_line, entry.get("cursors") or [])
                     break
 
             except Exception:
                 pass
 
-            # 再帰（break しない：子側で別のBINARY_OPERATOR/CALL_EXPRを見つけるため）
             child_map = self.func_walk(child)
-            for ln, lst in child_map.items():
-                results.setdefault(ln, []).extend(lst)
+            for ln, obj in (child_map or {}).items():
+                if not isinstance(obj, dict):
+                    continue
+                entry = results.setdefault(ln, {"line": ln, "spelling": "", "cursors": []})
+                entry["cursors"].extend(obj.get("cursors") or [])
+                entry["spelling"] = _canonicalize_spelling(ln, entry.get("cursors") or [])
 
         return results
 
@@ -430,24 +604,22 @@ class CodeAnalyzer:
         results_list = []
         try:
             x = self.all_AST(self.tu)
-
+            print(x)
             # DEBUG (around line 375): x の cursor の line / spelling を表示
-            try:
-                # x は {orig_line: [Cursor, ...], ... } を想定
-                for orig_ln, cursors in (x or {}).items():
-                    for i, cur in enumerate(cursors or []):
-                        try:
-                            loc = getattr(cur, "location", None)
-                            pre_line = int(getattr(loc, "line", 0) or 0) if loc else 0
-                            spelling = getattr(cur, "spelling", "")
-                            print(f"[DEBUG][compile:x] orig_line={orig_ln} pre_line={pre_line} idx={i} spelling={spelling!r}")
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-            
+            #try:
+            #    # x は {orig_line: [Cursor, ...], ... } を想定
+            #    for orig_ln, cursors in (x or {}).items():
+            #        for i, cur in enumerate(cursors or []):
+            #            try:
+            #                loc = getattr(cur, "location", None)
+            #                pre_line = int(getattr(loc, "line", 0) or 0) if loc else 0
+            #                spelling = getattr(cur, "spelling", "")
+            #                print(f"[DEBUG][compile:x] orig_line={orig_ln} pre_line={pre_line} idx={i} spelling={spelling!r}")
+            #            except Exception:
+            #                pass
+            #except Exception:
+            #    pass
             trees = self.build_expr_trees_from_all_ast_item(x)
-
             return trees
         except Exception:
             return -1
@@ -739,12 +911,20 @@ class CodeAnalyzer:
             return {"operator": op, "A": A, "B": B, "type": node_type, "kakko": bool(node_kakko)}
 
         trees = []
-        for _, cursors in x_item.items():
-            if not cursors:
+        spel = ""
+        print(x_item.items())  # items は呼び出す
+
+        for orig_ln, obj in x_item.items():
+            if not isinstance(obj, dict):
                 continue
-            for cursor in cursors:
+            spelling = obj.get("spelling", "")
+            cursors = obj.get("cursors", [])
+            print(spelling)
+            spel = spelling
+
+            for cursor in cursors or []:
                 t = _build(cursor)
                 if t:
                     trees.append(t)
 
-        return trees
+        return {"spelling": spel, "trees": trees}
