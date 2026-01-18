@@ -182,6 +182,15 @@ class CodeAnalyzer:
         try:
             if node is None:
                 return ""
+            
+            # 追加: node の列番号を取得（1-based）。取得できなければ 0。
+            col = 0
+            try:
+                loc = getattr(node, "location", None)
+                col = int(getattr(loc, "column", 0) or 0) if loc is not None else 0
+            except Exception:
+                col = 0
+            print("DEBUG[get_expr_name] col=", col)
 
             # 整数リテラル
             if node.kind == cindex.CursorKind.INTEGER_LITERAL:
@@ -451,7 +460,8 @@ class CodeAnalyzer:
                     return "break;"
 
             # 構文行以外は、まず置換方式で作る
-            rep = _make_spelling_by_replace(orig_ln, cursor_list)
+            rep = "@;"
+            #_make_spelling_by_replace(orig_ln, cursor_list)
 
             # 追加仕様:
             # 置換後の文字列が「@ と区切り記号だけ」なら "@;" に落とす
@@ -497,7 +507,8 @@ class CodeAnalyzer:
                     walk_calls(child)
 
                     entry["spelling"] = _canonicalize_spelling(orig_line, entry.get("cursors") or [])
-                    break
+                    continue
+                    #break
 
             except Exception:
                 pass
@@ -825,6 +836,30 @@ class CodeAnalyzer:
             # leaf は kakko を持たない（代わりに op/sub を持たせる）
             return {"type": t, "text": s, "op": op, "sub": ""}
 
+        # 追加: 式木から行内の leaf を集めて ["name","type"] を作る
+        def _is_name_or_const(txt: str) -> bool:
+            if not txt:
+                return False
+            if re.fullmatch(r'[A-Za-z_]\w*', txt):
+                return True
+            if re.fullmatch(r'(0[xX][0-9A-Fa-f]+|0[0-7]*|[0-9]+)([uUlL]{0,3})', txt):
+                return True
+            return False
+
+        def _collect_line_type_pairs(tree_or_leaf, out_list):
+            if tree_or_leaf is None:
+                return
+            if isinstance(tree_or_leaf, dict) and "operator" in tree_or_leaf:
+                _collect_line_type_pairs(tree_or_leaf.get("A"), out_list)
+                _collect_line_type_pairs(tree_or_leaf.get("B"), out_list)
+                return
+            if isinstance(tree_or_leaf, dict) and "text" in tree_or_leaf:
+                name = (tree_or_leaf.get("text") or "").strip()
+                typ = (tree_or_leaf.get("type") or "").strip() or "x"
+                if _is_name_or_const(name):
+                    out_list.append([name, typ])
+                return
+
         def _build(cur):
             if cur is None:
                 return None
@@ -912,6 +947,7 @@ class CodeAnalyzer:
 
         trees = []
         spel = ""
+        line_type_table = []
         print(x_item.items())  # items は呼び出す
 
         for orig_ln, obj in x_item.items():
@@ -926,5 +962,6 @@ class CodeAnalyzer:
                 t = _build(cursor)
                 if t:
                     trees.append(t)
+                    _collect_line_type_pairs(t, line_type_table)
 
-        return {"spelling": spel, "trees": trees}
+        return {"spelling": spel, "trees": trees, "LineTypeTable": line_type_table}
