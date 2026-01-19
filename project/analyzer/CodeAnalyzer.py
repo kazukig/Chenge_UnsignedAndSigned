@@ -282,15 +282,15 @@ class CodeAnalyzer:
 
             def walk(n):
                 try:
-                    for ch in n.get_children():
-                        if ch.kind == cindex.CursorKind.BINARY_OPERATOR:
-                            out.append(ch)
-                        walk(ch)
+                    if root_cursor.kind == cindex.CursorKind.BINARY_OPERATOR:
+                        out.append(root_cursor)
                 except Exception:
                     return
 
             if root_cursor is not None:
+                print("root_cursor = ", root_cursor)
                 walk(root_cursor)
+
             return out
 
         def _collect_arg_expr_roots(call_expr):
@@ -299,6 +299,8 @@ class CodeAnalyzer:
                 args = list(call_expr.get_arguments())
             except Exception:
                 args = []
+
+            print("args = ", args)
 
             def span_len(c):
                 try:
@@ -309,6 +311,7 @@ class CodeAnalyzer:
 
             for a in args:
                 binops = _collect_binops_in_subtree(a)
+                print("binops = ", binops)
                 if not binops:
                     continue
                 try:
@@ -488,7 +491,8 @@ class CodeAnalyzer:
 
                 if allowed_line is not None and orig_line != allowed_line:
                     raise Exception("filtered")
-
+                
+                print("DEBUG[func_walk] first-hit kind=", child.kind, "text=", getattr(child, "spelling", ""))
                 if child.kind == cindex.CursorKind.BINARY_OPERATOR:
                     entry = results.setdefault(orig_line, {"line": orig_line, "spelling": "", "cursors": []})
                     entry["cursors"].append(child)
@@ -514,6 +518,7 @@ class CodeAnalyzer:
                 pass
 
             child_map = self.func_walk(child)
+            print("child_map2 = ", child_map)
             for ln, obj in (child_map or {}).items():
                 if not isinstance(obj, dict):
                     continue
@@ -601,6 +606,7 @@ class CodeAnalyzer:
 
                 line_map = self.func_walk(cursor)
                 if line_map:
+                    print("line_map = ", line_map)
                     results_list = line_map
                     break
         return results_list
@@ -615,7 +621,6 @@ class CodeAnalyzer:
         results_list = []
         try:
             x = self.all_AST(self.tu)
-            print(x)
             # DEBUG (around line 375): x の cursor の line / spelling を表示
             #try:
             #    # x は {orig_line: [Cursor, ...], ... } を想定
@@ -948,7 +953,7 @@ class CodeAnalyzer:
         trees = []
         spel = ""
         line_type_table = []
-        print(x_item.items())  # items は呼び出す
+        print("items = ", x_item.items())  # items は呼び出す
 
         for orig_ln, obj in x_item.items():
             if not isinstance(obj, dict):

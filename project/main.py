@@ -277,7 +277,7 @@ def toText(func_table, res, spel=""):
 
     return out
 
-def MacroApply(pre_src_line: str, new_src_line: str, line_type_table) -> str:
+def MacroApply(pre_src_line: str, new_src_line: str, line_type_table, ft=None) -> str:
     """
     MacroApply
 
@@ -285,8 +285,7 @@ def MacroApply(pre_src_line: str, new_src_line: str, line_type_table) -> str:
       (1) pre_src_line: 変換前ソースの行（マクロ名を含みうる）
       (2) new_src_line: 変換後ソースの行（マクロが定数へ展開されている想定）
       (3) line_type_table: CodeAnalyzer compile 結果 x["LineTypeTable"]
-           形式: [[name, type], [name, type], ...]  または [{"変数or定数","型名"},...] 互換
-           ※本関数内で name->type の辞書へ正規化して使う
+      (4) ft: FunctionTable（関数判定に使用。Noneなら判定しない）
 
     返り値:
       return_line(str):
@@ -309,13 +308,24 @@ def MacroApply(pre_src_line: str, new_src_line: str, line_type_table) -> str:
     if not isinstance(new_src_line, str):
         new_src_line = "" if new_src_line is None else str(new_src_line)
 
+    # --- ft を sigur に正規化（getFunctionInfo が使えるように）---
+    func_table = ft
+
+    def _is_known_function(name: str) -> bool:
+        if not name or func_table is None:
+            return False
+        try:
+            info = func_table.getFunctionInfo(name)
+            return isinstance(info, dict) and int(info.get("argc", 0) or 0) >= 0
+        except Exception:
+            return False
+
     # --- line_type_table を name->type に正規化 ---
     name_to_type = {}
     try:
         if isinstance(line_type_table, list):
             for e in line_type_table:
                 if isinstance(e, dict):
-                    # {"name": "...", "type": "..."} 形式も来るかもしれないので吸収
                     n = e.get("name") or e.get("var") or e.get("text")
                     t = e.get("type")
                     if n and t:
@@ -332,6 +342,7 @@ def MacroApply(pre_src_line: str, new_src_line: str, line_type_table) -> str:
         |(?:\d+[uUlL]*)
         |(?:[A-Za-z_]\w*)
         |(?:==|!=|<=|>=|\+\+|--|->|&&|\|\|)
+        |(?:<<|>>)
         |(?:\S)
         """,
         re.VERBOSE,
@@ -346,71 +357,46 @@ def MacroApply(pre_src_line: str, new_src_line: str, line_type_table) -> str:
     def _is_number_like(t: str) -> bool:
         return re.fullmatch(r"(?:0[xX][0-9A-Fa-f]+|\d+)[uUlL]*", t or "") is not None
 
-    # 追加: new_src_line 上で、すでに付与済みのキャスト "( int ) ( ... )" を無視するための正規化
-    # 仕様:
-    #   - "( int ) ( 3U * b )" のように「キャスト + 括弧式」の外側だけを剥がす
-    #   - 内側の式トークン（ここでは "3U", "*", "b"）は残す
+    # "( int ) ( ... )" の外側を剥がす（既存）
     def _normalize_new_tokens_for_table(toks):
         out = []
         i = 0
         while i < len(toks):
-            # パターン: "(" TYPE ")" "(" ... ")"  を検出して外側2組の括弧を剥がす
             if toks[i] == "(":
-                # 1つ目の')'を探す
                 try:
                     j = toks.index(")", i + 1)
                 except ValueError:
                     j = -1
-                if j != -1:
-                    # "(" <type...> ")" "("
-                    if j + 1 < len(toks) and toks[j + 1] == "(":
-                        # type 部分が「型っぽい」ならキャスト扱い（超簡易）
-                        type_chunk = toks[i + 1:j]
-                        type_text = "".join(type_chunk).strip()
-
-                        # 型らしさ判定（記号や数値を含まず、識別子と空白/アンダースコア程度）
-                        is_cast = bool(type_text) and re.fullmatch(r"[A-Za-z_]\w*(?:\s*\*|\s+[A-Za-z_]\w*|\s*)*", type_text) is not None
-
-                        if is_cast:
-                            # 2つ目の括弧式の終端')'を探す（ネスト1段だけ対応）
-                            k = j + 1  # ここが '('
-                            depth = 0
-                            t = k
-                            while t < len(toks):
-                                if toks[t] == "(":
-                                    depth += 1
-                                elif toks[t] == ")":
-                                    depth -= 1
-                                    if depth == 0:
-                                        # toks[k+1:t] が中身
-                                        out.extend(toks[k + 1:t])
-                                        i = t + 1
-                                        break
-                                t += 1
-                            else:
-                                # ')' が見つからない場合は通常処理に落とす
-                                pass
-
-                            if i != 0 and (i >= len(toks) or (len(out) and out[-1] == toks[i - 1])):
-                                # すでに進んでいるので continue
-                                continue
-
+                if j != -1 and j + 1 < len(toks) and toks[j + 1] == "(":
+                    type_text = "".join(toks[i + 1:j]).strip()
+                    is_cast = bool(type_text) and re.fullmatch(
+                        r"[A-Za-z_]\w*(?:\s*\*|\s+[A-Za-z_]\w*|\s*)*", type_text
+                    ) is not None
+                    if is_cast:
+                        k = j + 1
+                        depth = 0
+                        t = k
+                        while t < len(toks):
+                            if toks[t] == "(":
+                                depth += 1
+                            elif toks[t] == ")":
+                                depth -= 1
+                                if depth == 0:
+                                    out.extend(toks[k + 1:t])
+                                    i = t + 1
+                                    break
+                            t += 1
+                        else:
+                            pass
+                        continue
             out.append(toks[i])
             i += 1
         return out
 
-    def _strip_cast_prefix_tokens(toks):
-        i = 0
-        n = len(toks)
-        while i + 2 < n and toks[i] == "(":
-            try:
-                j = toks.index(")", i + 1)
-            except ValueError:
-                break
-            i = j + 1
-        return toks[i:]
-
-    # --- 変換用テーブルの作成（要求: ["変数or定数", ...]） ---
+    # --- 変換用テーブル抽出 ---
+    # 要求:
+    # compare_and_select が関数なら、引数内部を「数値/識別子/キャスト付き識別子」に展開して
+    # '5', 'a', '(int)b', '5', 'b', '5U' のように取れる必要がある
     def _extract_table(s: str, normalize_cast_expr: bool = False):
         toks = _tokens(s)
         if normalize_cast_expr:
@@ -419,25 +405,34 @@ def MacroApply(pre_src_line: str, new_src_line: str, line_type_table) -> str:
         out = []
         i = 0
         while i < len(toks):
-            t = toks[i]
-            # "(type)name" を 1要素として扱う： ( ... ) IDENT の形をまとめる
-            if t == "(":
+            # (type)IDENT を 1要素としてまとめる（例: "(int)b"）
+            if toks[i] == "(":
                 try:
                     j = toks.index(")", i + 1)
                 except ValueError:
                     j = -1
-                if j != -1 and j + 1 < len(toks) and (_is_ident(toks[j + 1]) or _is_number_like(toks[j + 1])):
-                    casted = "".join(toks[i:j + 2])
-                    out.append(casted)
-                    i = j + 2
-                    continue
+
+                # "(type)NUMBER" はここではまとめない（分解して "NUMBER" を拾う）
+                # 例: "(int)5" は "5" として扱う
+                # fallthrough
+
+            t = toks[i]
+
+            # 関数名単体（func( ) の func）を拾う
+            if _is_ident(t) and (i + 1 < len(toks) and toks[i + 1] == "("):
+                out.append(t)
+                i += 1
+                continue
+
+            # 識別子 / 数値
             if _is_ident(t) or _is_number_like(t):
                 out.append(t)
+
             i += 1
+
         return out
 
     pre_table = _extract_table(pre_src_line, normalize_cast_expr=False)
-    # ★ここが変更点：new 側は既存キャスト "(int)(...)" を無視してテーブル抽出
     new_table = _extract_table(new_src_line, normalize_cast_expr=True)
 
     # 追加: 変換用テーブルを出力
@@ -448,8 +443,6 @@ def MacroApply(pre_src_line: str, new_src_line: str, line_type_table) -> str:
         pass
 
     # --- マクロ変換表（macro -> const）推定 ---
-    # zip の位置合わせが崩れることがある（例: new 側に "int" が混入）ので、
-    # new_table 側の「型っぽいトークン」を除去してから対応付けする。
     type_words = {"int", "signed", "unsigned", "short", "long", "char", "float", "double", "size_t", "ptrdiff_t", "bool"}
     try:
         for _, t in name_to_type.items():
@@ -459,123 +452,85 @@ def MacroApply(pre_src_line: str, new_src_line: str, line_type_table) -> str:
     except Exception:
         pass
 
+    # new_table の中の "int" などは「型」なので落とす。ただし関数名は落とさない。
     new_table2 = []
     for t in new_table:
         if _is_ident(t) and t in type_words:
-            continue
+            # 次が "(" で関数呼び出しなら関数名なので落とさない、という判定を入れたいが
+            # new_table は "(" を保持していないので、ft があれば関数判定で救う
+            if not _is_known_function(t):
+                continue
         new_table2.append(t)
 
-    macro_to_const = {}
+    macro_to_const = []
     for a, b in zip(pre_table, new_table2):
         if a == b:
             continue
 
-        # new 側がキャスト付き "(type)X" なら剥がして比較
-        b_strip = b
-        try:
-            bt = _tokens(b)
-            bt2 = _strip_cast_prefix_tokens(bt)
-            b_strip = "".join(bt2) if bt2 else b
-        except Exception:
-            b_strip = b
-
-        if b_strip == a:
+        # a が関数名で、b が "(type)func" のように変わるのはマクロではないので除外
+        if _is_ident(a) and _is_known_function(a):
             continue
 
-        # pre が識別子、new が数値なら macro->const とみなす
-        if _is_ident(a) and (_is_number_like(b_strip) or _is_number_like(b)):
-            const_val = b_strip if _is_number_like(b_strip) else b
-            macro_to_const.setdefault(a, const_val)
+        # b が "(type)func" のように関数 + キャストなら除外
+        if isinstance(b, str) and re.match(r'^\(\s*[^()]+\s*\)\s*[A-Za-z_]\w*$', b):
+            m = re.match(r'^\(\s*[^()]+\s*\)\s*([A-Za-z_]\w*)$', b)
+            if m and _is_known_function(m.group(1)):
+                continue
 
-    # 追加: マクロ変換表を出力
+        # pre が識別子、new が数値なら macro->const とみなす（重複も保持）
+        if _is_ident(a) and _is_number_like(b):
+            macro_to_const.append({"text": a, "value": b})
+
     try:
         print("[DEBUG][MacroApply] macro_to_const =", macro_to_const)
     except Exception:
         pass
 
-    # 逆引き（const -> macro）を「左から順」で適用する
-    # 同一 const が複数 macro に対応しても、pre_table の出現順で 1個ずつ消費する。
-    const_to_macros_in_order = []
-    try:
-        ordered_macros = []
-        seen = set()
-        for tok in pre_table:
-            if tok in macro_to_const and tok not in seen:
-                ordered_macros.append(tok)
-                seen.add(tok)
-
-        # (const, macro) を pre_table 左から順に積む
-        for m in ordered_macros:
-            const_to_macros_in_order.append((macro_to_const[m], m))
-    except Exception:
-        const_to_macros_in_order = []
-
-    # --- new_src_line をベースに、定数をマクロへ戻す（左から順に） ---
+    # --- 定数->マクロ 置換（左から順に消費）---
     new_toks = _tokens(new_src_line)
     out_toks = list(new_toks)
 
-    # ★重要: 同じ定数(例: "3U")が複数回出る場合、左から順に別 macro を当てる
     i = 0
     k = 0
-    while i < len(out_toks) and k < len(const_to_macros_in_order):
-        const_val, macro_name = const_to_macros_in_order[k]
-        if out_toks[i] == const_val:
+    while i < len(out_toks) and k < len(macro_to_const):
+        m = macro_to_const[k]
+        const_val = m.get("value", "")
+        macro_name = m.get("text", "")
+        if const_val and macro_name and out_toks[i] == const_val:
             out_toks[i] = macro_name
             k += 1
         i += 1
 
-    # --- 二項演算子上の macro には (x)(MACRO) を付与する ---
-    macro_names = set(macro_to_const.keys())
+    # --- キャスト付与（既存ロジックのまま）---
+    macro_names = set()
+    try:
+        for m in macro_to_const:
+            if isinstance(m, dict) and m.get("text"):
+                macro_names.add(m["text"])
+    except Exception:
+        macro_names = set()
 
     bin_ops = {"+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", "<", ">", "<=", ">=", "==", "!=", "&&", "||"}
 
-    # <<, >> 再合成
-    i = 0
-    while i < len(out_toks):
-        if i + 1 < len(out_toks) and (out_toks[i], out_toks[i + 1]) in (("<", "<"), (">", ">")):
-            op = out_toks[i] + out_toks[i + 1]
-            if op in bin_ops:
-                out_toks[i:i + 2] = [op]
-                continue
-        i += 1
-
     def _operand_key(tok: str) -> str:
-        """
-        型引き用のキーに正規化:
-          - "(u8)(x)" / "(int)(x)" のようなキャストを剥がして "x" を返す（単純対応）
-          - それ以外はそのまま
-        """
         if not isinstance(tok, str):
             return ""
         tt = tok.strip()
-        # "(T)(name)" 形式を name に寄せる（ネストは浅く）
         m = re.match(r'^\(\s*[^()]+\s*\)\s*\(\s*([A-Za-z_]\w*)\s*\)\s*$', tt)
         if m:
             return m.group(1)
-        # "(T)name" 形式
         m = re.match(r'^\(\s*[^()]+\s*\)\s*([A-Za-z_]\w*)\s*$', tt)
         if m:
             return m.group(1)
         return tt
 
     def _pick_cast_type_for_macro(macro_name: str, other_operand_tok: str) -> str:
-        """
-        macro_name の展開定数の型（3U など）を、相手オペランドの型へ合わせる。
-        例:
-          macro_to_const["ABCDEFG"] == "3U"
-          other は "b" で、b の型が "u8" なら "(u8)(ABCDEFG)" を付けたい
-        """
-        # 相手オペランドの型を得る
         other_key = _operand_key(other_operand_tok)
         other_type = (name_to_type.get(other_key) or "").strip()
         if not other_type:
-            return ""  # 型が取れないなら何もしない
-
-        # "unsigned int" や "u8" のような別名が来るので、最小限の正規化だけする
-        # ここでは「相手の型名をそのままキャストに使う」方針にする
+            return ""
         return other_type
 
-    # 二項演算子の左右に macro がある場合、その反対側の型に合わせて macro をキャスト
     i = 0
     while i < len(out_toks):
         op = out_toks[i]
@@ -586,28 +541,23 @@ def MacroApply(pre_src_line: str, new_src_line: str, line_type_table) -> str:
                 L = out_toks[li]
                 R = out_toks[ri]
 
-                # 右が macro：左の型に合わせる
                 if isinstance(R, str) and R in macro_names:
                     cast_t = _pick_cast_type_for_macro(R, L)
                     if cast_t:
                         out_toks[ri] = f"({cast_t})({R})"
 
-                # 左が macro：右の型に合わせる
                 if isinstance(L, str) and L in macro_names:
                     cast_t = _pick_cast_type_for_macro(L, R)
                     if cast_t:
                         out_toks[li] = f"({cast_t})({L})"
         i += 1
 
-    # --- 文字列へ戻す（軽い整形） ---
+    # --- 戻す・整形 ---
     return_line = "".join(out_toks)
     return_line = re.sub(r"\s+", " ", return_line).strip()
     return_line = re.sub(r"\s*([()\[\]{};,:])\s*", r"\1", return_line)
     return_line = re.sub(r"\s*([+\-*/%<>=!&|^~])\s*", r" \1 ", return_line)
     return_line = re.sub(r"\s+", " ", return_line).strip()
-
-    # 追加: 構造体参照の "->" を崩さない（"t - > a" を "t->a" に戻す）
-    # 先に " - > " を詰めてから、残った空白も許容して詰める
     return_line = return_line.replace("- >", "->")
     return_line = re.sub(r"\s*-\s*>\s*", "->", return_line)
 
@@ -660,7 +610,8 @@ if __name__ == "__main__":
         with open(src, 'r', encoding='utf-8', errors='ignore') as f:
             before_line = f.readlines()[coords[1]-1].rstrip("\n")
 
-        txt2 = MacroApply(before_line, txt, x.get("LineTypeTable", []))
+            
+        txt2 = MacroApply(before_line, txt, x.get("LineTypeTable", []), ft)
         print("MacroApply:", txt2)
 
         exit(1)
