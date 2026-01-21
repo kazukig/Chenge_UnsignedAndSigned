@@ -441,19 +441,172 @@ class CodeAnalyzer:
             if not raw:
                 return ""
 
-            # ブロック開始の "{" を末尾から検出（スペース類を挟んでもOK）
-            has_lbrace = bool(re.search(r'\{\s*$', raw))
+            has_lbrace = bool(re.search(r"\{\s*$", raw))
 
+            # 追加: 行頭が「型名」で始まる宣言っぽい行は
+            #   - "型名 変数 = ..." → "型名 変数 = @;"
+            #   - "型名 変数;"      → "型名 @;"
+            # のように正規化する（型名は実際に使用されたものを維持）
+            try:
+                toks = raw.split()
+                head = (toks[0] if toks else "")
+                second = (toks[1] if len(toks) >= 2 else "")
+                third = (toks[2] if len(toks) >= 3 else "")
+
+                # 可能な限り多めの型名（C本体 + stdint + よくあるtypedef/マクロ）
+                type_heads = {
+                    # --- C built-in / keywords ---
+                    "void",
+                    "char", "signed", "unsigned",
+                    "short", "int", "long",
+                    "float", "double",
+                    "_Bool", "bool",
+                    "_Complex", "complex",
+                    "_Imaginary",
+
+                    # qualifiers（先頭に来ることがある）
+                    "const", "volatile", "restrict",
+                    "_Atomic", "atomic",
+                    "static", "extern", "register", "auto", "inline",
+
+                    # --- stdint.h (C99) ---
+                    "int8_t", "int16_t", "int32_t", "int64_t",
+                    "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+                    "int_least8_t", "int_least16_t", "int_least32_t", "int_least64_t",
+                    "uint_least8_t", "uint_least16_t", "uint_least32_t", "uint_least64_t",
+                    "int_fast8_t", "int_fast16_t", "int_fast32_t", "int_fast64_t",
+                    "uint_fast8_t", "uint_fast16_t", "uint_fast32_t", "uint_fast64_t",
+                    "intptr_t", "uintptr_t",
+                    "intmax_t", "uintmax_t",
+
+                    # --- stddef.h / common ---
+                    "size_t", "ptrdiff_t", "wchar_t",
+                    "ssize_t", "off_t",
+
+                    # --- common platform typedefs ---
+                    "u8", "u16", "u32", "u64",
+                    "i8", "i16", "i32", "i64",
+                    "byte_t", "sbyte_t", "word_t", "sword_t",
+                    "ushort", "uint", "ulong", "uchar",
+                    "UCHAR", "USHORT", "UINT", "ULONG", "ULONGLONG",
+                    "INT8", "UINT8", "INT16", "UINT16", "INT32", "UINT32", "INT64", "UINT64",
+
+                    # --- fixed-width / aliases sometimes used ---
+                    "u_int8_t", "u_int16_t", "u_int32_t", "u_int64_t",
+                    "u_long", "u_int", "u_short", "u_char",
+
+                    # --- common boolean aliases ---
+                    "BOOLEAN", "Bool", "bool_t",
+
+                    # --- typo/variation (requested) ---
+                    "usngiend",  # "usngiend int"
+                    "usngiend",  # keep (duplicate harmless)
+                }
+
+                two_word_types = {
+                    ("unsigned", "char"),
+                    ("unsigned", "short"),
+                    ("unsigned", "int"),
+                    ("unsigned", "long"),
+                    ("signed", "char"),
+                    ("signed", "int"),
+                    ("long", "long"),
+                    ("long", "double"),
+                }
+
+                qualifiers = {"const", "volatile", "restrict", "_Atomic", "static", "extern", "register", "auto", "inline"}
+
+                def _starts_with_type(tokens):
+                    if not tokens:
+                        return None  # (type_str, type_token_count)
+                    h = tokens[0]
+                    s = tokens[1] if len(tokens) >= 2 else ""
+                    t = tokens[2] if len(tokens) >= 3 else ""
+
+                    # qualifier + type
+                    if h in qualifiers and s:
+                        # qualifier + (two-word type)
+                        if (s, t) in two_word_types:
+                            return (f"{s} {t}", 3)
+                        if s in type_heads:
+                            return (s, 2)
+
+                    # three-word: unsigned long long
+                    if h == "unsigned" and s == "long" and t == "long":
+                        return ("unsigned long long", 3)
+
+                    # two-word
+                    if (h, s) in two_word_types:
+                        return (f"{h} {s}", 2)
+
+                    # one-word
+                    if h in type_heads:
+                        return (h, 1)
+
+                    # struct/enum/union head
+                    if h in {"struct", "enum", "union"}:
+                        return (h, 1)
+
+                    return None
+
+                swt = _starts_with_type(toks)
+                if swt:
+                    type_str, n_type = swt
+
+                    # 型の次のトークンを「宣言対象（変数名など）」として拾う
+                    after = toks[n_type:]  # 残り
+                    # 例: int32_t a = b + 5; -> after = ["a","=","b","+","5;"]
+                    #     u8 *p = ...        -> after = ["*p","=",...]
+                    name_tok = after[0] if after else ""
+
+                    # 変数名の簡易正規化: 先頭の '*' '&' を剥がす
+                    name_clean = re.sub(r'^[\*\&]+', '', name_tok).strip()
+
+                    # "=" があるなら代入宣言扱い: "型名 変数 = @;"
+                    if "=" in raw:
+                        # name_clean が空なら fallback
+                        lhs = f"{type_str} {name_clean}".strip() if name_clean else f"{type_str} @"
+                        return f"{lhs} = @;"
+
+                    # "=" が無い宣言: "型名 @;"
+                    return f"{type_str} @;"
+
+            except Exception:
+                pass
+
+            # （以下は既存の演算子行頭判定/if/for/while 等の正規化処理）
             # 行頭キーワード判定（case/break も追加）
-            m = re.match(r'^\s*(if|for|while|return|case|break)\b', raw)
+            # NOTE:
+            #  - && / || は "word boundary (\b)" が成立しないので別扱いで先に判定する
+            #  - まず演算子行頭を拾い、その後に従来のキーワードを拾う
+            m = re.match(r'^\s*(&&|\|\||\+|-|/|%|>>|<<)', raw)
+            if m:
+                kw = m.group(1)
+
+                # 変更: 末尾の ')' 個数に応じて ")..." を付与（末尾の文字は維持）
+                # 例: "&& ( ... )){}" のように末尾が '}' の場合は "&& (@){}" のようにする
+                tail_parens = ")" * trailing_rparens
+                tail_other = "" if last_char == ")" else last_char
+
+                if kw == "||":
+                    return f"|| (@){tail_parens}{tail_other}"
+                if kw == "&&":
+                    return f"&& (@){tail_parens}{tail_other}"
+                if kw in {"+", "-", "/", "%", ">>", "<<"}:
+                    return f"{kw} (@){tail_parens}{tail_other}"
+
+            m = re.match(r'^\s*(if|else if|else|for|while|return|case|break)\b', raw)
             if m:
                 kw = m.group(1)
                 if kw == "if":
                     return "if( @ ){" if has_lbrace else "if( @ )"
+                if kw == "else if":
+                    return "else if( @ ){" if has_lbrace else "else if( @ )"
+                if kw == "else":
+                    return "else ( @ ){" if has_lbrace else "else( @ )"
                 if kw == "while":
                     return "while( @ ){" if has_lbrace else "while( @ )"
                 if kw == "for":
-                    # ユーザ指定どおり末尾 ';' を含める（for( @; @; @;)）
                     return "for( @; @; @;){" if has_lbrace else "for( @; @; @;)"
                 if kw == "return":
                     return "return @;"
@@ -462,6 +615,12 @@ class CodeAnalyzer:
                 if kw == "break":
                     return "break;"
 
+                if kw == "||":
+                    return "|| (@);"
+                if kw == "&&":
+                    return "&& (@);"
+
+            
             # 構文行以外は、まず置換方式で作る
             rep = "@;"
             #_make_spelling_by_replace(orig_ln, cursor_list)
@@ -511,6 +670,7 @@ class CodeAnalyzer:
                     walk_calls(child)
 
                     entry["spelling"] = _canonicalize_spelling(orig_line, entry.get("cursors") or [])
+                    print("[533]entry_spelling=", entry["spelling"])
                     continue
                     #break
 
@@ -525,7 +685,7 @@ class CodeAnalyzer:
                 entry = results.setdefault(ln, {"line": ln, "spelling": "", "cursors": []})
                 entry["cursors"].extend(obj.get("cursors") or [])
                 entry["spelling"] = _canonicalize_spelling(ln, entry.get("cursors") or [])
-
+                print("[533]entry_spelling=", entry["spelling"])
         return results
 
     def func_calcprm(self, node):
@@ -759,6 +919,10 @@ class CodeAnalyzer:
             # （ただし他の演算子や括弧などが含まれる場合は従来通り False）
             s2 = s.replace("->", "")
 
+            # 追加: 配列アクセス a[20], b[10] を許容するため、"[...]" を全て除去して判定する
+            # 例: "a[20]" -> "a", "arr[i+1]" -> "arr"（中身は問わず除去）
+            s2 = re.sub(r"\[[^\]]*\]", "", s2)
+            
             # "." は元から許可（regexに含めない）
             if re.search(r'[\(\)\+\-\*/%=\[\],<>]', s2):
                 return False
@@ -791,7 +955,7 @@ class CodeAnalyzer:
                     if not _is_simple_term_text(s):
                         s = "x"
                         t = "x"
-            print("s = ", s)
+            print("s2 = ", s)
             # op: 変数=0 / マクロで定義した変数=1 / 関数=2 / 定数=3 / それ以外=4
             def _classify_op(cursor, text: str) -> int:
                 try:

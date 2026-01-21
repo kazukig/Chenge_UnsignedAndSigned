@@ -394,10 +394,8 @@ def MacroApply(pre_src_line: str, new_src_line: str, line_type_table, ft=None) -
         return out
 
     # --- 変換用テーブル抽出 ---
-    # 要求:
-    # compare_and_select が関数なら、引数内部を「数値/識別子/キャスト付き識別子」に展開して
-    # '5', 'a', '(int)b', '5', 'b', '5U' のように取れる必要がある
-    def _extract_table(s: str, normalize_cast_expr: bool = False):
+    # 変更(最小限): "(type)ident" のキャストは "type" と "ident" に分解せず "(type)ident" として保持する
+    def _extract_table(s: str, normalize_cast_expr: bool = False, drop_leading_type: bool = False):
         toks = _tokens(s)
         if normalize_cast_expr:
             toks = _normalize_new_tokens_for_table(toks)
@@ -405,20 +403,28 @@ def MacroApply(pre_src_line: str, new_src_line: str, line_type_table, ft=None) -
         out = []
         i = 0
         while i < len(toks):
-            # (type)IDENT を 1要素としてまとめる（例: "(int)b"）
+            # 追加: "( type ) ident" を "(type)ident" として1要素にまとめる
             if toks[i] == "(":
                 try:
                     j = toks.index(")", i + 1)
                 except ValueError:
                     j = -1
+                if j != -1 and j + 1 < len(toks) and _is_ident(toks[j + 1]):
+                    # "(type)func(" は既存どおり関数扱いでまとめる（その後の "(" は残す）
+                    if j + 2 < len(toks) and toks[j + 2] == "(":
+                        casted_name = "".join(toks[i:j + 2])  # "(int)compare_and_select"
+                        out.append(casted_name)
+                        i = j + 2
+                        continue
 
-                # "(type)NUMBER" はここではまとめない（分解して "NUMBER" を拾う）
-                # 例: "(int)5" は "5" として扱う
-                # fallthrough
+                    # "(type)ident"（変数キャスト）は必ず "(type)ident" として保持
+                    out.append("".join(toks[i:j + 2]))  # "(int)b"
+                    i = j + 2
+                    continue
 
             t = toks[i]
 
-            # 関数名単体（func( ) の func）を拾う
+            # 関数名単体（func( ) の func）を拾う（従来）
             if _is_ident(t) and (i + 1 < len(toks) and toks[i + 1] == "("):
                 out.append(t)
                 i += 1
@@ -452,18 +458,42 @@ def MacroApply(pre_src_line: str, new_src_line: str, line_type_table, ft=None) -
     except Exception:
         pass
 
+    # 追加: 行頭が型宣言なら、テーブル作成時は型名を除外し、返却時に先頭へ戻す
+    def _leading_type_prefix(s: str) -> str:
+        toks = _tokens(s)
+        if not toks:
+            return ""
+        # "unsigned long long" / "unsigned long" / "unsigned int"
+        if len(toks) >= 2 and toks[0] in {"unsigned", "signed"} and toks[1] in {"int", "long", "short", "char"}:
+            if len(toks) >= 3 and toks[0] == "unsigned" and toks[1] == "long" and toks[2] == "long":
+                return "unsigned long long "
+            return f"{toks[0]} {toks[1]} "
+        # one-word type
+        if toks[0] in type_words:
+            return f"{toks[0]} "
+        return ""
+
+    pre_prefix = _leading_type_prefix(pre_src_line)
+    new_prefix = _leading_type_prefix(new_src_line)
+    decl_prefix = pre_prefix or new_prefix
+
     # new_table の中の "int" などは「型」なので落とす。ただし関数名は落とさない。
     new_table2 = []
     for t in new_table:
+        if decl_prefix and t == decl_prefix.strip():
+            continue
         if _is_ident(t) and t in type_words:
-            # 次が "(" で関数呼び出しなら関数名なので落とさない、という判定を入れたいが
-            # new_table は "(" を保持していないので、ft があれば関数判定で救う
             if not _is_known_function(t):
                 continue
         new_table2.append(t)
 
+    # 変更: pre_table 側も先頭が型名なら除外（誤マッピング防止）
+    pre_table2 = list(pre_table)
+    if decl_prefix and pre_table2 and pre_table2[0] == decl_prefix.strip():
+        pre_table2 = pre_table2[1:]
+
     macro_to_const = []
-    for a, b in zip(pre_table, new_table2):
+    for a, b in zip(pre_table2, new_table2):
         if a == b:
             continue
 
@@ -490,16 +520,30 @@ def MacroApply(pre_src_line: str, new_src_line: str, line_type_table, ft=None) -
     new_toks = _tokens(new_src_line)
     out_toks = list(new_toks)
 
+    # 追加: 先頭が型名なら out_toks から一旦落として、式に処理した後で prefix を付け直す
+    cut = 0
+    if decl_prefix:
+        pref_words = [w for w in decl_prefix.strip().split(" ") if w]
+        j = 0
+        for w in pref_words:
+            if j < len(out_toks) and out_toks[j] == w:
+                j += 1
+        cut = j
+
+    expr_toks = out_toks[cut:]
+
     i = 0
     k = 0
-    while i < len(out_toks) and k < len(macro_to_const):
+    while i < len(expr_toks) and k < len(macro_to_const):
         m = macro_to_const[k]
         const_val = m.get("value", "")
         macro_name = m.get("text", "")
-        if const_val and macro_name and out_toks[i] == const_val:
-            out_toks[i] = macro_name
+        if const_val and macro_name and expr_toks[i] == const_val:
+            expr_toks[i] = macro_name
             k += 1
         i += 1
+
+    out_toks = out_toks[:cut] + expr_toks
 
     # --- キャスト付与（既存ロジックのまま）---
     macro_names = set()
@@ -531,21 +575,19 @@ def MacroApply(pre_src_line: str, new_src_line: str, line_type_table, ft=None) -
             return ""
         return other_type
 
-    i = 0
+    i = cut  # ★型名の前は見ない
     while i < len(out_toks):
         op = out_toks[i]
         if op in bin_ops:
             li = i - 1
             ri = i + 1
-            if 0 <= li < len(out_toks) and 0 <= ri < len(out_toks):
+            if cut <= li < len(out_toks) and cut <= ri < len(out_toks):
                 L = out_toks[li]
                 R = out_toks[ri]
-
                 if isinstance(R, str) and R in macro_names:
                     cast_t = _pick_cast_type_for_macro(R, L)
                     if cast_t:
                         out_toks[ri] = f"({cast_t})({R})"
-
                 if isinstance(L, str) and L in macro_names:
                     cast_t = _pick_cast_type_for_macro(L, R)
                     if cast_t:
@@ -558,7 +600,25 @@ def MacroApply(pre_src_line: str, new_src_line: str, line_type_table, ft=None) -
     return_line = re.sub(r"\s*([()\[\]{};,:])\s*", r"\1", return_line)
     return_line = re.sub(r"\s*([+\-*/%<>=!&|^~])\s*", r" \1 ", return_line)
     return_line = re.sub(r"\s+", " ", return_line).strip()
+
+    # 追加: 宣言の "intb" 連結を防ぐ（型名の後ろに必ず空白）
+    if decl_prefix and return_line.startswith(decl_prefix.strip()):
+        return_line = re.sub(rf'^{re.escape(decl_prefix.strip())}\s*', decl_prefix, return_line)
+
     return_line = return_line.replace("- >", "->")
+    return_line = return_line.replace("& &", "&&")
+    return_line = return_line.replace("! =", "!=")
+    return_line = return_line.replace("& =", "&=")
+    return_line = return_line.replace("| =", "|=")
+    return_line = return_line.replace("+ =", "+=")
+    return_line = return_line.replace("- =", "-=")
+    return_line = return_line.replace("* =", "*=")
+    return_line = return_line.replace("% =", "%=")
+    return_line = return_line.replace("/ =", "/=")
+    return_line = return_line.replace("| |", "||")
+    return_line = return_line.replace("< <", "<<")
+    return_line = return_line.replace("> >", ">>")
+    return_line = return_line.replace("elseif", "else if")
     return_line = re.sub(r"\s*-\s*>\s*", "->", return_line)
 
     return return_line
