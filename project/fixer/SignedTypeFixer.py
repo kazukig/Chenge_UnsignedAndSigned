@@ -94,263 +94,168 @@ class SignedTypeFixer:
             # U/u だけ除去（Lは残す）
             return num + "".join([c for c in suf if c not in ("u", "U")])
 
-    def solveSignedTypedConflict(self, run_result):
+    def solveSignedTypedConflict(self, analize_result):
         """
-        引数:
-          run_result: {operator,A,B,type,text,kakko} node を root に持つ木構造のリスト
-
-        返り値:
-          ボトムアップ処理後の木構造リスト。
-          最終的には各要素が leaf: {"type":..., "text":...} になる（= 1つの式に縮約）。
-
-        処理(ボトムアップ):
-          (1) 末端node(A,Bがleaf)をワークから探す
-          (2) A/Bどちらをキャストするか決める（定数優先、両変数ならB）
-          (3) キャスト先型を決める（相手の type 表記）
-          (4) キャストを leaf.text に反映し、node を {type,text} に縮約
-          (5) 結果リスト(work自体)を更新
+        解析結果から符号型不一致を検出し、必要ならキャストを挿入した式文字列を返す。
+        Step5: unsigned/signedが一致していても型が異なればキャストする。
+        left_type == right_type の場合のみ型変換は行わない。
         """
-        if not run_result or not isinstance(run_result, list):
-            return run_result
+        def dbg(*args):
+            if DEF_DEBUG:
+                print("[SignedTypeFixerDBG]", *args)
 
-        import copy
-        work = copy.deepcopy(run_result)
+        # --- 1. eval_datas 取得 ---
+        eval_datas = analize_result.get("eval_datas", [])
+        if not eval_datas:
+            dbg("eval_datas is empty")
+            return []
 
-        def _is_node(n) -> bool:
-            return isinstance(n, dict) and "operator" in n and "A" in n and "B" in n
+        data = eval_datas[0]
+        dbg("STEP1: eval_datas[0]", data)
 
-        def _is_leaf(n) -> bool:
-            return isinstance(n, dict) and "operator" not in n and "type" in n and "text" in n
+        left_cursor = data.get("left_val_cursor_head")
+        right_cursor = data.get("right_val_cursor_head")
+        left_val = data.get("left_val_spelling")
+        dbg("left_val(init):", left_val)
+        right_val = data.get("right_val_spelling")
+        dbg("right_val(init):", right_val)
+        op = data.get("operator_spelling")
+        spelling = analize_result.get("spelling", "")
 
-        def _wrap_once(s: str) -> str:
-            """
-            既に「式全体」が最外の () で1組に包まれているならそのまま。
-            そうでなければ ( ... ) を付与する。
+        # --- 2. 型取得（typedef名とcanonical型の両方） ---
+        def get_types(cursor):
+            if cursor is None:
+                dbg("get_types: cursor is None")
+                return None, None
+            try:
+                # デバッグ: cursor情報
+                try:
+                    dbg("get_types: cursor.spelling =", getattr(cursor, "spelling", "<no spelling>"))
+                    dbg("get_types: cursor.kind =", getattr(cursor, "kind", "<no kind>"))
+                    dbg("get_types: cursor.type.spelling =", getattr(getattr(cursor, "type", None), "spelling", "<no type>"))
+                    dbg("get_types: cursor.type.get_canonical().spelling =", getattr(getattr(cursor, "type", None).get_canonical(), "spelling", "<no canonical>") if getattr(cursor, "type", None) else "<no type>")
+                except Exception as e:
+                    dbg("get_types: debug info error:", e)
+                # DECL_REF_EXPRやINTEGER_LITERALなら型を返す
+                if hasattr(cursor, "kind"):
+                    if cursor.kind.name == "DECL_REF_EXPR" or cursor.kind.name == "INTEGER_LITERAL":
+                        type_spelling = getattr(getattr(cursor, "type", None), "spelling", None)
+                        canonical_spelling = None
+                        try:
+                            canonical_spelling = cursor.type.get_canonical().spelling
+                        except Exception:
+                            canonical_spelling = None
+                        dbg("get_types: return type =", type_spelling, "canonical =", canonical_spelling)
+                        return type_spelling, canonical_spelling
+                # 子ノードを再帰的に探索
+                for child in getattr(cursor, "get_children", lambda: [])():
+                    t, c = get_types(child)
+                    if t or c:
+                        return t, c
+            except Exception as e:
+                dbg("get_types: exception", e)
+            return None, None
 
-            例:
-              "(a+b)"        -> そのまま
-              "(a+b)+c"      -> "((a+b)+c)"  （先頭'('が途中で閉じる）
-              "(b-4)%(2+c)"  -> "((b-4)%(2+c))"（複合）
-              "a"            -> "(a)"
-            """
-            s = (s or "").strip()
-            if not s:
-                return s
+        left_type, left_type_canon = get_types(left_cursor)
+        dbg("left_type(after get_types):", left_type)
+        dbg("left_type_canon(after get_types):", left_type_canon)
+        right_type, right_type_canon = get_types(right_cursor)
+        dbg("right_type(after get_types):", right_type)
+        dbg("right_type_canon(after get_types):", right_type_canon)
+        dbg("STEP2: left_type", left_type, "left_type_canon", left_type_canon, "right_type", right_type, "right_type_canon", right_type_canon)
 
-            # まず先頭/末尾が括弧でないなら付与
-            if not (s.startswith("(") and s.endswith(")")):
-                return f"({s})"
+        # --- 3. unsigned/signed判定はcanonical型で ---
+        def is_primitive_int(t):
+            return any(x in t for x in [
+                "int", "uint", "int8", "int16", "int32", "int64", "unsigned", "signed"
+            ])
+        def is_unsigned(t):
+            return "unsigned" in t or t.strip().startswith("u")
 
-            # 先頭 '(' が末尾 ')' とペアになって「全体」を包んでいるかチェック
-            depth = 0
-            first_pair_closes_at = None
-            for i, ch in enumerate(s):
-                if ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-                    if depth == 0:
-                        first_pair_closes_at = i
-                        break
+        left_is_int = is_primitive_int(left_type_canon or "")
+        right_is_int = is_primitive_int(right_type_canon or "")
+        left_is_unsigned = is_unsigned(left_type_canon or "")
+        right_is_unsigned = is_unsigned(right_type_canon or "")
+        dbg("STEP3: left_is_int", left_is_int, "right_is_int", right_is_int, "left_is_unsigned", left_is_unsigned, "right_is_unsigned", right_is_unsigned)
 
-            # パースできない/途中で閉じた → 全体を包む括弧ではないので追加
-            if first_pair_closes_at is None:
-                return f"({s})"
+        # --- 4. 単行式・定数判定 ---
+        def is_numeric_literal(s):
+            return bool(re.fullmatch(r'[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?[uUlLfF]*', str(s).strip()))
 
-            # 先頭の '(' が末尾の ')' で閉じている（=最外が全体を包む）なら追加しない
-            if first_pair_closes_at == len(s) - 1:
-                return s
+        left_is_const = is_numeric_literal(left_val)
+        dbg("left_is_const(after is_numeric_literal):", left_is_const)
+        right_is_const = is_numeric_literal(right_val)
+        dbg("right_is_const(after is_numeric_literal):", right_is_const)
+        dbg("STEP4: left_is_const", left_is_const, "right_is_const", right_is_const)
 
-            # 途中で閉じた（= "(...)+..." や "(... )%( ... )" など複合）→ 追加
-            return f"({s})"
+        # --- 5. キャスト要否判定（仕様変更） ---
+        # 両方int型で型名が一致していればキャスト不要
+        if left_is_int and right_is_int and left_type == right_type:
+            dbg("STEP5: 型名一致なのでキャスト不要")
+            eval_val = f"{left_val} {op} {right_val}"
+            dbg("eval_val(no cast):", eval_val)
+            result = spelling.replace("@1", eval_val)
+            dbg("STEP6: result", result)
+            return result
 
-        def _needs_wrap_for_cast(txt: str) -> bool:
-            s = (txt or "").strip()
-            if not s:
-                return False
-            if s.startswith("(") and s.endswith(")"):
-                return False
-            return bool(re.search(r'[\s\+\-\*/%<>=&|^]', s))
+        # 型名が異なればunsigned/signed一致でもキャストする
+        if left_is_int and right_is_int:
+            dbg("STEP5: 型名不一致なのでキャスト実施")
+            # --- 6. キャスト対象決定（typedef名などプリミティブでない型を使う） ---
+            which = "right"
+            cast_type = left_type  # デフォルトは左辺の型（typedef名などプリミティブでない型）
+            if not right_type:
+                which = "right"
+                cast_type = left_type
+            elif not left_type:
+                which = "left"
+                cast_type = right_type
+            elif right_is_const:
+                which = "right"
+                cast_type = left_type
+            elif left_is_const:
+                which = "left"
+                cast_type = right_type
+            elif len(str(left_val)) < len(str(right_val)):
+                which = "left"
+                cast_type = right_type
+            dbg("which(after cast target decision):", which)
+            dbg("cast_type(after cast target decision):", cast_type)
+            dbg("STEP7: which", which, "cast_type", cast_type)
 
-        def _prec(op: str) -> int:
-            if op == "=":
-                return 1
-            if op in ("||",):
-                return 2
-            if op in ("&&",):
-                return 3
-            if op in ("==", "!=", "<=", ">=", "<", ">"):
-                return 4
-            if op in ("<<", ">>"):
-                return 5
-            if op in ("+", "-"):
-                return 6
-            if op in ("*", "/", "%"):
-                return 7
-            return 10
-
-        def _assoc(op: str) -> str:
-            return "right" if op == "=" else "left"
-
-        def _is_associative(op: str) -> bool:
-            return op in ("+", "*", "&&", "||")
-
-        def _needs_paren(child, parent_op: str, is_right_child: bool) -> bool:
-            if not _is_node(child):
-                return False
-            cop = (child.get("operator") or "").strip()
-            pop = (parent_op or "").strip()
-            if not pop:
-                return False
-            cp, pp = _prec(cop), _prec(pop)
-            if cp < pp:
-                return True
-            if cp > pp:
-                return False
-            if _assoc(pop) == "right":
-                return not is_right_child
-            if _assoc(pop) == "left" and pop in ("-", "/", "%", "<<", ">>"):
-                return is_right_child
-            if _is_associative(pop) and cop == pop:
-                return False
-            return True
-
-        def _to_expr(n, parent_op: str = "", is_right_child: bool = False) -> str:
-            if _is_leaf(n):
-                return (n.get("text") or "").strip()
-            if not _is_node(n):
-                return str(n)
-
-            op = (n.get("operator") or "").strip()
-            A = n.get("A")
-            B = n.get("B")
-            left = _to_expr(A, op, False)
-            right = _to_expr(B, op, True)
-
-            if _needs_paren(A, op, False):
-                left = _wrap_once(left)
-            if _needs_paren(B, op, True):
-                right = _wrap_once(right)
-
-            expr = f"{left} {op} {right} "
-
-            if parent_op and _needs_paren(n, parent_op, is_right_child):
-                expr = _wrap_once(expr)
-
-            if bool(n.get("kakko")):
-                expr = _wrap_once(expr)
-
-            return expr
-
-        # (1) 末端 node を探す（深い側優先）
-        def _find_bottom_node(root):
-            if not _is_node(root):
-                return None
-            A = root.get("A")
-            B = root.get("B")
-            if _is_node(A):
-                t = _find_bottom_node(A)
-                if t is not None:
-                    return t
-            if _is_node(B):
-                t = _find_bottom_node(B)
-                if t is not None:
-                    return t
-            if _is_leaf(A) and _is_leaf(B):
-                return root
-            return None
-
-        # (2) キャスト対象の決定
-        def _choose_cast_side(node) -> str:
-            A = node["A"]
-            B = node["B"]
-            a_const = self._is_integer_literal_token(A.get("text", ""))
-            b_const = self._is_integer_literal_token(B.get("text", ""))
-            if a_const and b_const:
-                return "B"
-            if a_const:
-                return "A"
-            if b_const:
-                return "B"
-            return "B"
-
-        # (3) キャスト先型
-        def _decide_cast_type(node, cast_side: str) -> str:
-            if cast_side == "A":
-                return node["B"].get("type", "x")
-            return node["A"].get("type", "x")
-
-        def _is_mismatch(a_type: str, b_type: str) -> bool:
-            at = self._normalize_actual_type(a_type)
-            bt = self._normalize_actual_type(b_type)
-            if not self._is_integer_type(at) or not self._is_integer_type(bt):
-                return False
-            return self._is_unsigned(at) != self._is_unsigned(bt)
-
-        # (4) leaf.text 更新
-        def _apply_cast_to_leaf(leaf: dict, target_type: str) -> dict:
-            new_leaf = dict(leaf)
-            txt = (new_leaf.get("text") or "").strip()
-
-            if self._is_integer_literal_token(txt):
-                make_unsigned = self._is_unsigned(self._normalize_actual_type(target_type))
-                new_leaf["text"] = self._toggle_unsigned_literal_suffix(txt, make_unsigned)
-            else:
-                if _needs_wrap_for_cast(txt):
-                    new_leaf["text"] = f"({target_type}){_wrap_once(txt)}"
+            # --- 7. キャスト式生成 ---
+            def cast_expr(expr, ctype, is_const, make_unsigned):
+                if is_const:
+                    # 定数の場合はキャストせず、Uサフィックスでunsigned/signedを調整
+                    return self._toggle_unsigned_literal_suffix(expr, make_unsigned)
                 else:
-                    new_leaf["text"] = f"({target_type}){txt}"
-
-            new_leaf["type"] = target_type
-            return new_leaf
-
-        # 1要素(root)を完全にleafへ縮約
-        def _reduce_one(root):
-            guard = 0
-            while True:
-                guard += 1
-                if guard > 100000:
-                    break
-
-                if _is_leaf(root):
-                    return root
-                if not _is_node(root):
-                    # 想定外は文字列化してleaf化
-                    return {"type": "x", "text": str(root)}
-
-                target = _find_bottom_node(root)
-                if target is None:
-                    # これ以上分解できないので丸ごと式化してleaf化
-                    return {"type": root.get("type", "x"), "text": _to_expr(root)}
-
-                A = target["A"]
-                B = target["B"]
-                if DEF_DEBUG: print("A = ", A)
-                if DEF_DEBUG: print("B = ", B)
-
-                if _is_mismatch(A.get("type"), B.get("type")):
-                    side = _choose_cast_side(target)
-                    if DEF_DEBUG:  print("side = ", side)
-                    cast_type = _decide_cast_type(target, side)
-                    if DEF_DEBUG:  print("cast_type = ", cast_type)
-                    if side == "A":
-                        target["A"] = _apply_cast_to_leaf(A, cast_type)
+                    # 変数や式の場合はキャスト
+                    if re.match(r'^[\w\d_]+$', str(expr)):
+                        return f"({ctype}){expr}"
                     else:
-                        target["B"] = _apply_cast_to_leaf(B, cast_type)
-                    target["type"] = cast_type
-                else:
-                    target["type"] = target["A"].get("type", "x")
-                if DEF_DEBUG: print("A2 = ", target["A"])
-                if DEF_DEBUG: print("B2 = ", target["B"])
-                if DEF_DEBUG: print("target type = ", target["type"])
+                        return f"({ctype})({expr})"
 
-                # nodeをleafへ縮約（ボトムアップを進めるため必須）
-                if DEF_DEBUG: print("previous target = ", target)
-                target_leaf = {"type": target.get("type", "x"), "text": _to_expr(target)}
-                target.clear()
-                target.update(target_leaf)
+            # unsigned判定はキャスト型のcanonical型で判定
+            make_unsigned = self._is_unsigned(self._normalize_actual_type(cast_type))
 
-        for i in range(len(work)):
-            work[i] = _reduce_one(work[i])
+            if which == "left":
+                left_val = cast_expr(left_val, cast_type, left_is_const, make_unsigned)
+                dbg("left_val(after cast):", left_val)
+            else:
+                right_val = cast_expr(right_val, cast_type, right_is_const, make_unsigned)
+                dbg("right_val(after cast):", right_val)
+            dbg("STEP8: left_val", left_val, "right_val", right_val)
 
-        return work
+            eval_val = f"{left_val} {op} {right_val}"
+            dbg("eval_val(final):", eval_val)
+            result = spelling.replace("@1", eval_val)
+            dbg("STEP9: result", result)
+            return result
+
+        # int型でない場合はキャスト不要
+        dbg("STEP5: どちらかがint系でないのでキャスト不要")
+        eval_val = f"{left_val} {op} {right_val}"
+        dbg("eval_val(no cast):", eval_val)
+        result = spelling.replace("@1", eval_val)
+        dbg("STEP6: result", result)
+        return result

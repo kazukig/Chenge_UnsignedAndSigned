@@ -5,6 +5,9 @@ import subprocess
 import tempfile
 from clang import cindex
 
+# 追加: デバッグON/OFF（要求: 7行めに DEBUG=1 を置いて if で print）
+DEBUG = 1
+
 class CodeAnalyzer:
     # compile:      指定された行の式を分析用のjsonデータにコンパイルする
     # decompile:    分析用のjsonデータを式に逆コンパイルする
@@ -49,649 +52,8 @@ class CodeAnalyzer:
 
     def getTu(self):
         return self.tu
-
-    def _resolve_type(self, type_str: str) -> str:
-        """
-        typedef テーブルを使って与えられた型記述を再帰的に展開する。
-        self._type_table の各要素は [alias, actual, rels, [file, [lines...]]] という形を想定。
-        深さ制限を入れて無限ループを防ぐ。
-        """
-        if not type_str:
-            return type_str
-
-        # type_table を辞書化(alias -> actual)
-        type_map = {}
-        try:
-            for entry in self._type_table:
-                if isinstance(entry, (list, tuple)) and len(entry) >= 2:
-                    alias = str(entry[0])
-                    actual = str(entry[1]) if entry[1] is not None else ""
-                    type_map[alias] = actual
-        except Exception:
-            return type_str
-
-        token_re = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\b')
-
-        sys.setrecursionlimit(max(1000, sys.getrecursionlimit()))
-
-        def resolve_token(tok: str, seen: set, depth: int) -> str:
-            if depth > 50:
-                return tok
-            if tok in seen:
-                return tok
-            if tok in type_map and type_map[tok] and type_map[tok] != tok:
-                seen.add(tok)
-                base = type_map[tok]
-                return token_re.sub(lambda m: resolve_token(m.group(1), seen.copy(), depth + 1), base)
-            return tok
-
-        try:
-            resolved = token_re.sub(lambda m: resolve_token(m.group(1), set(), 0), type_str)
-            return " ".join(resolved.split())
-        except Exception:
-            return type_str
-            
-    # --- トークン / 式 ヘルパー ---
-    def _get_token_text(self, node):
-        try:
-            return "".join([t.spelling for t in node.get_tokens()]).strip()
-        except Exception:
-            return ""
-
-    def get_expr_type(self, node):
-        try:
-            if node is None:
-                return ""
-
-            # 整数リテラル
-            if node.kind == cindex.CursorKind.INTEGER_LITERAL:
-                tok = self._get_token_text(node)
-                if not tok:
-                    return "int"
-                if "u" in tok.lower():
-                    return "unsigned int"
-                return "int"
-
-            # 追加: 構造体/共用体のメンバ参照なら「参照先メンバ」の型を返す
-            # 例: a.b / a->b なら b の型（intなど）
-            if node.kind in (
-                cindex.CursorKind.MEMBER_REF_EXPR,
-                cindex.CursorKind.MEMBER_REF,
-            ):
-                try:
-                    ref = getattr(node, "referenced", None)
-                    if ref is not None:
-                        rt = getattr(ref, "type", None)
-                        if rt and rt.spelling:
-                            return rt.spelling
-                except Exception:
-                    pass
-
-            # 宣言への参照なら参照先の型を優先して取得する
-            if node.kind == cindex.CursorKind.DECL_REF_EXPR:
-                ref = getattr(node, "referenced", None)
-                if ref is not None:
-                    rt = getattr(ref, "type", None)
-                    if rt:
-                        s = rt.spelling
-                        if s:
-                            return s
-
-            # キャスト系:
-            # ここは「元の型」ではなく「キャスト後の型」を返すのが自然なので、
-            # node.type を優先し、取れなければ子へフォールバックする。
-            if node.kind in (
-                cindex.CursorKind.IMPLICIT_CAST_EXPR,
-                cindex.CursorKind.CSTYLE_CAST_EXPR,
-                cindex.CursorKind.CXX_STATIC_CAST_EXPR,
-                cindex.CursorKind.CXX_CONST_CAST_EXPR,
-                cindex.CursorKind.CXX_REINTERPRET_CAST_EXPR,
-            ):
-                t = getattr(node, "type", None)
-                if t and t.spelling:
-                    return t.spelling
-                for c in node.get_children():
-                    tt = self.get_expr_type(c)
-                    if tt:
-                        return tt
-
-            # UNEXPOSED は子を辿る
-            if node.kind == cindex.CursorKind.UNEXPOSED_EXPR:
-                for c in node.get_children():
-                    tt = self.get_expr_type(c)
-                    if tt:
-                        return tt
-
-            # フォールバック: node.type を使う
-            t = getattr(node, "type", None)
-            if t:
-                s = t.spelling
-                if s:
-                    return s
-        except Exception:
-            pass
-
-        # 最終フォールバック: 子を再帰的に探索
-        for c in node.get_children():
-            tt = self.get_expr_type(c)
-            if tt:
-                return tt
-        return ""
-
-    def get_expr_name(self, node):
-        try:
-            if node is None:
-                return ""
-            
-            # 追加: node の列番号を取得（1-based）。取得できなければ 0。
-            col = 0
-            try:
-                loc = getattr(node, "location", None)
-                col = int(getattr(loc, "column", 0) or 0) if loc is not None else 0
-            except Exception:
-                col = 0
-            print("DEBUG[get_expr_name] col=", col)
-
-            # 整数リテラル
-            if node.kind == cindex.CursorKind.INTEGER_LITERAL:
-                tok = self._get_token_text(node)
-                if tok:
-                    return tok
-
-            # 追加: 構造体メンバ参照は "." / "->" を省略しない（トークン列をそのまま返す）
-            # 例: a.b / a->b を "b" ではなく "a.b" / "a->b" として返したい
-            if node.kind in (
-                cindex.CursorKind.MEMBER_REF_EXPR,
-                cindex.CursorKind.MEMBER_REF,
-            ):
-                tok = self._get_token_text(node)
-                if tok:
-                    return tok
-
-            # 通常: spelling 優先
-            s = getattr(node, "spelling", "")
-            if s:
-                return s
-
-            # フォールバック: トークン
-            tok = self._get_token_text(node)
-            if tok:
-                return tok
-        except Exception:
-            pass
-
-        # 子を再帰的に探索
-        for c in node.get_children():
-            n = self.get_expr_name(c)
-            if n:
-                return n
-        return ""
-
-    def _is_int_or_unsigned_int(self, type_str: str) -> bool:
-        if not type_str:
-            return False
-        s = type_str.replace("const", "").replace("volatile", "").strip()
-        return s in ("int", "unsigned int", "unsigned", "int32_t", "uint32_t")
-
-    # --- AST 走査 ---
-    def func_walk(self, node):
-        """
-        node 配下を再帰的に走査し、BINARY_OPERATOR の Cursor を収集する。
-
-        返り値（変更後）:
-          {
-            orig_line(int): {
-              "line": orig_line,
-              "spelling": "<その行の文字列。抽出式部分は @ に置換>",
-              "cursors": [Cursor, Cursor, ...]
-            },
-            ...
-          }
-
-        spelling 仕様:
-          (1) 基本は「元ソースのその行」。
-          (2) 抽出した式（ここで収集する cursor の token 範囲）に該当する部分を '@' に置き換える。
-              - cursor から 'return' 等を探して作らない
-              - あくまで「抽出した式の範囲」を行テキスト上で '@' 化する
-
-        例:
-          if(a + b)                -> "if(@)"
-          switch(func(a+b,5+c))    -> "switch(func(@,@))"
-          return (a + b)           -> "return @"
-        """
-        results = {}
-        if node is None:
-            return results
-
-        allowed_line = self.check_list  # None ならフィルタしない
-
-        # --- helpers ---
-        def _to_orig_line(cursor) -> int:
-            try:
-                loc = getattr(cursor, "location", None)
-                pre_line = int(getattr(loc, "line", 0) or 0) if loc else 0
-                if not pre_line:
-                    return 0
-                mapped = self.preproc_map.get(pre_line)
-                return int(mapped[1]) if mapped and len(mapped) >= 2 else pre_line
-            except Exception:
-                return 0
-
-        def _collect_binops_in_subtree(root_cursor):
-            out = []
-
-            def walk(n):
-                try:
-                    if root_cursor.kind == cindex.CursorKind.BINARY_OPERATOR:
-                        out.append(root_cursor)
-                except Exception:
-                    return
-
-            if root_cursor is not None:
-                print("root_cursor = ", root_cursor)
-                walk(root_cursor)
-
-            return out
-
-        def _collect_arg_expr_roots(call_expr):
-            roots = []
-            try:
-                args = list(call_expr.get_arguments())
-            except Exception:
-                args = []
-
-            print("args = ", args)
-
-            def span_len(c):
-                try:
-                    ex = c.extent
-                    return int(ex.end.offset) - int(ex.start.offset)
-                except Exception:
-                    return 0
-
-            for a in args:
-                binops = _collect_binops_in_subtree(a)
-                print("binops = ", binops)
-                if not binops:
-                    continue
-                try:
-                    roots.append(max(binops, key=span_len))
-                except Exception:
-                    roots.append(binops[0])
-            return roots
-
-        def _get_orig_line_text(orig_ln: int) -> str:
-            try:
-                with open(self.src_file, "r", errors="ignore") as f:
-                    lines = f.read().splitlines()
-                if 1 <= orig_ln <= len(lines):
-                    return lines[orig_ln - 1]
-            except Exception:
-                pass
-            return ""
-
-        def _cursor_to_line_span(cursor, orig_ln: int):
-            """
-            cursor の token を使い、orig_ln 行上での [start_col, end_col) を推定する。
-            - column は 1-based を想定
-            - end_col は「最後のトークン末尾の次」(exclusive)
-            失敗したら None を返す。
-            """
-            try:
-                if cursor is None:
-                    return None
-                toks = list(cursor.get_tokens())
-                if not toks:
-                    return None
-
-                line_toks = []
-                for t in toks:
-                    try:
-                        loc = getattr(t, "location", None)
-                        tl = int(getattr(loc, "line", 0) or 0) if loc else 0
-                        mapped = self.preproc_map.get(tl)
-                        t_orig_ln = int(mapped[1]) if mapped and len(mapped) >= 2 else tl
-                        if t_orig_ln == orig_ln:
-                            line_toks.append(t)
-                    except Exception:
-                        continue
-
-                if not line_toks:
-                    return None
-
-                first = line_toks[0]
-                last = line_toks[-1]
-
-                start_col = int(getattr(getattr(first, "location", None), "column", 0) or 0)
-                if start_col <= 0:
-                    return None
-
-                last_col = int(getattr(getattr(last, "location", None), "column", 0) or 0)
-                if last_col <= 0:
-                    return None
-
-                end_col = last_col + len(getattr(last, "spelling", "") or "")
-                if end_col <= start_col:
-                    return None
-
-                return (start_col - 1, end_col)
-            except Exception:
-                return None
-
-        def _make_spelling_by_replace(orig_ln: int, cursor_list):
-            """
-            orig_ln の行テキストに対し、cursor_list の範囲を '@' に置換して spelling を作る。
-            """
-            line_text = _get_orig_line_text(orig_ln)
-            if not line_text:
-                return ""
-
-            spans = []
-            for cur in cursor_list or []:
-                sp = _cursor_to_line_span(cur, orig_ln)
-                if sp is None:
-                    continue
-                s, e = sp
-                s = max(0, min(s, len(line_text)))
-                e = max(0, min(e, len(line_text)))
-                if e > s:
-                    spans.append((s, e))
-
-            if not spans:
-                return line_text.strip()
-
-            spans.sort(key=lambda x: (x[0], x[1]))
-            merged = []
-            for s, e in spans:
-                if not merged or s > merged[-1][1]:
-                    merged.append([s, e])
-                else:
-                    merged[-1][1] = max(merged[-1][1], e)
-
-            out = []
-            pos = 0
-            for s, e in merged:
-                out.append(line_text[pos:s])
-                out.append("@")
-                pos = e
-            out.append(line_text[pos:])
-
-            return "".join(out).strip()
-
-        def _canonicalize_spelling(orig_ln: int, cursor_list):
-            """
-            行頭のキーワードに応じて定型フォーマットへ正規化する。
-            - if    -> "if( @ )"   (+ 行末に "{" があれば "if( @ ){" )
-            - while -> "while( @ )" (+ 同上 )
-            - for   -> "for( @; @; @;)" (+ 行末に "{" があれば "for( @; @; @;){" )
-            - return-> "return @;"
-            - case  -> "case @:"
-            - break -> "break;"
-            それ以外は replace 方式の結果を返す。
-
-            追加仕様:
-              行が構文キーワード以外に「@ 以外の実体」を含まない場合は "@;" を返す。
-              例:
-                "@"        -> "@;"
-                "(@)"      -> "@;"
-                "@ + @;"   -> "@;"
-              ただし if/while/for/return/case/break などの構文行はこの規則より優先。
-            """
-            raw = _get_orig_line_text(orig_ln).strip()
-            if not raw:
-                return ""
-
-            has_lbrace = bool(re.search(r"\{\s*$", raw))
-
-            # 追加: 行頭が「型名」で始まる宣言っぽい行は
-            #   - "型名 変数 = ..." → "型名 変数 = @;"
-            #   - "型名 変数;"      → "型名 @;"
-            # のように正規化する（型名は実際に使用されたものを維持）
-            try:
-                toks = raw.split()
-                head = (toks[0] if toks else "")
-                second = (toks[1] if len(toks) >= 2 else "")
-                third = (toks[2] if len(toks) >= 3 else "")
-
-                # 可能な限り多めの型名（C本体 + stdint + よくあるtypedef/マクロ）
-                type_heads = {
-                    # --- C built-in / keywords ---
-                    "void",
-                    "char", "signed", "unsigned",
-                    "short", "int", "long",
-                    "float", "double",
-                    "_Bool", "bool",
-                    "_Complex", "complex",
-                    "_Imaginary",
-
-                    # qualifiers（先頭に来ることがある）
-                    "const", "volatile", "restrict",
-                    "_Atomic", "atomic",
-                    "static", "extern", "register", "auto", "inline",
-
-                    # --- stdint.h (C99) ---
-                    "int8_t", "int16_t", "int32_t", "int64_t",
-                    "uint8_t", "uint16_t", "uint32_t", "uint64_t",
-                    "int_least8_t", "int_least16_t", "int_least32_t", "int_least64_t",
-                    "uint_least8_t", "uint_least16_t", "uint_least32_t", "uint_least64_t",
-                    "int_fast8_t", "int_fast16_t", "int_fast32_t", "int_fast64_t",
-                    "uint_fast8_t", "uint_fast16_t", "uint_fast32_t", "uint_fast64_t",
-                    "intptr_t", "uintptr_t",
-                    "intmax_t", "uintmax_t",
-
-                    # --- stddef.h / common ---
-                    "size_t", "ptrdiff_t", "wchar_t",
-                    "ssize_t", "off_t",
-
-                    # --- common platform typedefs ---
-                    "u8", "u16", "u32", "u64",
-                    "i8", "i16", "i32", "i64",
-                    "byte_t", "sbyte_t", "word_t", "sword_t",
-                    "ushort", "uint", "ulong", "uchar",
-                    "UCHAR", "USHORT", "UINT", "ULONG", "ULONGLONG",
-                    "INT8", "UINT8", "INT16", "UINT16", "INT32", "UINT32", "INT64", "UINT64",
-
-                    # --- fixed-width / aliases sometimes used ---
-                    "u_int8_t", "u_int16_t", "u_int32_t", "u_int64_t",
-                    "u_long", "u_int", "u_short", "u_char",
-
-                    # --- common boolean aliases ---
-                    "BOOLEAN", "Bool", "bool_t",
-
-                    # --- typo/variation (requested) ---
-                    "usngiend",  # "usngiend int"
-                    "usngiend",  # keep (duplicate harmless)
-                }
-
-                two_word_types = {
-                    ("unsigned", "char"),
-                    ("unsigned", "short"),
-                    ("unsigned", "int"),
-                    ("unsigned", "long"),
-                    ("signed", "char"),
-                    ("signed", "int"),
-                    ("long", "long"),
-                    ("long", "double"),
-                }
-
-                qualifiers = {"const", "volatile", "restrict", "_Atomic", "static", "extern", "register", "auto", "inline"}
-
-                def _starts_with_type(tokens):
-                    if not tokens:
-                        return None  # (type_str, type_token_count)
-                    h = tokens[0]
-                    s = tokens[1] if len(tokens) >= 2 else ""
-                    t = tokens[2] if len(tokens) >= 3 else ""
-
-                    # qualifier + type
-                    if h in qualifiers and s:
-                        # qualifier + (two-word type)
-                        if (s, t) in two_word_types:
-                            return (f"{s} {t}", 3)
-                        if s in type_heads:
-                            return (s, 2)
-
-                    # three-word: unsigned long long
-                    if h == "unsigned" and s == "long" and t == "long":
-                        return ("unsigned long long", 3)
-
-                    # two-word
-                    if (h, s) in two_word_types:
-                        return (f"{h} {s}", 2)
-
-                    # one-word
-                    if h in type_heads:
-                        return (h, 1)
-
-                    # struct/enum/union head
-                    if h in {"struct", "enum", "union"}:
-                        return (h, 1)
-
-                    return None
-
-                swt = _starts_with_type(toks)
-                if swt:
-                    type_str, n_type = swt
-
-                    # 型の次のトークンを「宣言対象（変数名など）」として拾う
-                    after = toks[n_type:]  # 残り
-                    # 例: int32_t a = b + 5; -> after = ["a","=","b","+","5;"]
-                    #     u8 *p = ...        -> after = ["*p","=",...]
-                    name_tok = after[0] if after else ""
-
-                    # 変数名の簡易正規化: 先頭の '*' '&' を剥がす
-                    name_clean = re.sub(r'^[\*\&]+', '', name_tok).strip()
-
-                    # "=" があるなら代入宣言扱い: "型名 変数 = @;"
-                    if "=" in raw:
-                        # name_clean が空なら fallback
-                        lhs = f"{type_str} {name_clean}".strip() if name_clean else f"{type_str} @"
-                        return f"{lhs} = @;"
-
-                    # "=" が無い宣言: "型名 @;"
-                    return f"{type_str} @;"
-
-            except Exception:
-                pass
-
-            # （以下は既存の演算子行頭判定/if/for/while 等の正規化処理）
-            # 行頭キーワード判定（case/break も追加）
-            # NOTE:
-            #  - && / || は "word boundary (\b)" が成立しないので別扱いで先に判定する
-            #  - まず演算子行頭を拾い、その後に従来のキーワードを拾う
-            m = re.match(r'^\s*(&&|\|\||\+|-|/|%|>>|<<)', raw)
-            if m:
-                kw = m.group(1)
-
-                # 変更: 末尾の ')' 個数に応じて ")..." を付与（末尾の文字は維持）
-                # 例: "&& ( ... )){}" のように末尾が '}' の場合は "&& (@){}" のようにする
-                tail_parens = ")" * trailing_rparens
-                tail_other = "" if last_char == ")" else last_char
-
-                if kw == "||":
-                    return f"|| (@){tail_parens}{tail_other}"
-                if kw == "&&":
-                    return f"&& (@){tail_parens}{tail_other}"
-                if kw in {"+", "-", "/", "%", ">>", "<<"}:
-                    return f"{kw} (@){tail_parens}{tail_other}"
-
-            m = re.match(r'^\s*(if|else if|else|for|while|return|case|break)\b', raw)
-            if m:
-                kw = m.group(1)
-                if kw == "if":
-                    return "if( @ ){" if has_lbrace else "if( @ )"
-                if kw == "else if":
-                    return "else if( @ ){" if has_lbrace else "else if( @ )"
-                if kw == "else":
-                    return "else ( @ ){" if has_lbrace else "else( @ )"
-                if kw == "while":
-                    return "while( @ ){" if has_lbrace else "while( @ )"
-                if kw == "for":
-                    return "for( @; @; @;){" if has_lbrace else "for( @; @; @;)"
-                if kw == "return":
-                    return "return @;"
-                if kw == "case":
-                    return "case @:"
-                if kw == "break":
-                    return "break;"
-
-                if kw == "||":
-                    return "|| (@);"
-                if kw == "&&":
-                    return "&& (@);"
-
-            
-            # 構文行以外は、まず置換方式で作る
-            rep = "@;"
-            #_make_spelling_by_replace(orig_ln, cursor_list)
-
-            # 追加仕様:
-            # 置換後の文字列が「@ と区切り記号だけ」なら "@;" に落とす
-            # - @ の個数や位置は問わない
-            # - 構造的な識別子/数値/文字列/演算子が残っていないことを条件にする
-            #   例: "if(@)" は if があるので上で処理済み
-            #   例: "@ + @" は '+' があるので NG（=> "@;" にする）
-            #   ユーザ要望は「構文以外に何もない」ので、演算子も「何もない」に含めない（=> 演算子があれば @;）
-            if rep:
-                # 許可: 空白, @, 括弧, セミコロン, コロン, カンマ, ブレース
-                # これ以外が残る(英数字や演算子等)なら「何かある」
-                leftover = re.sub(r'[\s@()\[\]{};:,]', '', rep)
-                if leftover == "":
-                    return "@;"
-
-            return rep
-
-        # --- main walk ---
-        for child in node.get_children():
-            try:
-                orig_line = _to_orig_line(child)
-                if not orig_line:
-                    raise Exception("no line")
-
-                if allowed_line is not None and orig_line != allowed_line:
-                    raise Exception("filtered")
-                
-                print("DEBUG[func_walk] first-hit kind=", child.kind, "text=", getattr(child, "spelling", ""))
-                if child.kind == cindex.CursorKind.BINARY_OPERATOR:
-                    entry = results.setdefault(orig_line, {"line": orig_line, "spelling": "", "cursors": []})
-                    entry["cursors"].append(child)
-
-                    def walk_calls(n):
-                        try:
-                            for ch in n.get_children():
-                                if ch.kind == cindex.CursorKind.CALL_EXPR:
-                                    for r in _collect_arg_expr_roots(ch):
-                                        entry2 = results.setdefault(orig_line, {"line": orig_line, "spelling": "", "cursors": []})
-                                        entry2["cursors"].append(r)
-                                walk_calls(ch)
-                        except Exception:
-                            return
-
-                    walk_calls(child)
-
-                    entry["spelling"] = _canonicalize_spelling(orig_line, entry.get("cursors") or [])
-                    print("[533]entry_spelling=", entry["spelling"])
-                    continue
-                    #break
-
-            except Exception:
-                pass
-
-            child_map = self.func_walk(child)
-            print("child_map2 = ", child_map)
-            for ln, obj in (child_map or {}).items():
-                if not isinstance(obj, dict):
-                    continue
-                entry = results.setdefault(ln, {"line": ln, "spelling": "", "cursors": []})
-                entry["cursors"].extend(obj.get("cursors") or [])
-                entry["spelling"] = _canonicalize_spelling(ln, entry.get("cursors") or [])
-                print("[533]entry_spelling=", entry["spelling"])
-        return results
-
-    def func_calcprm(self, node):
-        return 0
-
-    # --- プリプロセス / マッピング ---
+    
+        # --- プリプロセス / マッピング ---
     def _preprocess_file(self, src_path, extra_args):
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(src_path)[1])
         tmp.close()
@@ -713,7 +75,9 @@ class CodeAnalyzer:
                         last_directive_pre = pre_ln
                         last_directive_orig = int(m.group(1))
                         last_directive_file = m.group(2)
-                        mapping[pre_ln] = (pre_path, pre_ln)
+
+                        # 変更: directive 行も「元ファイル/元行」に寄せる
+                        mapping[pre_ln] = (last_directive_file, last_directive_orig)
                     else:
                         if last_directive_pre is not None and pre_ln > last_directive_pre:
                             orig_ln = last_directive_orig + (pre_ln - last_directive_pre - 1)
@@ -746,391 +110,1320 @@ class CodeAnalyzer:
             pass
         return None
 
-    def all_AST(self, tu):
-        results_list = []
-        if tu is None:
-            return results_list
+    # ---------------------------------------------------------------------
+    # CodeAnalyzer.md 仕様反映: all_AST / func_walk / makeLineMacroData / getTargetInfo
+    # ---------------------------------------------------------------------
 
-        for cursor in tu.cursor.get_children():
-            if cursor.kind == cindex.CursorKind.FUNCTION_DECL and cursor.is_definition():
-                start = cursor.extent.start
-                mapped = self.preproc_map.get(start.line) if self.preproc_map else None
-                orig_file = mapped[0] if mapped else None
-                if not orig_file:
-                    continue
-                try:
-                    if os.path.abspath(orig_file) != os.path.abspath(self.src_file):
-                        continue
-                except Exception:
-                    continue
+    # --- small utils ------------------------------------------------------
 
-                line_map = self.func_walk(cursor)
-                if line_map:
-                    print("line_map = ", line_map)
-                    results_list = line_map
-                    break
-        return results_list
+    _DELIMS = set([
+        ' ', '\t', '\r', '\n',
+        ')', '(', ';', ',', '+', '-', '*', '/', '%', '&', '|', '^', '!', '~',
+        '<', '>', '=', '?', ':', '[', ']', '{', '}'
+    ])
 
-    # --- メイン実行 ---
-    def compile(self):
-        """
-        解析を実行して JSON 風のリスト（辞書のリスト）を返す。
-        失敗したら -1 を返す。
-        返却される各辞書には元のソースの行番号を "line" として含む。
-        """
-        results_list = []
+    def _read_src_line(self, path: str, line_no: int) -> str:
         try:
-            x = self.all_AST(self.tu)
-            # DEBUG (around line 375): x の cursor の line / spelling を表示
-            #try:
-            #    # x は {orig_line: [Cursor, ...], ... } を想定
-            #    for orig_ln, cursors in (x or {}).items():
-            #        for i, cur in enumerate(cursors or []):
-            #            try:
-            #                loc = getattr(cur, "location", None)
-            #                pre_line = int(getattr(loc, "line", 0) or 0) if loc else 0
-            #                spelling = getattr(cur, "spelling", "")
-            #                print(f"[DEBUG][compile:x] orig_line={orig_ln} pre_line={pre_line} idx={i} spelling={spelling!r}")
-            #            except Exception:
-            #                pass
-            #except Exception:
-            #    pass
-            trees = self.build_expr_trees_from_all_ast_item(x)
-            return trees
+            with open(path, "r", errors="ignore") as f:
+                for i, line in enumerate(f, 1):
+                    if i == line_no:
+                        return line.rstrip("\n")
         except Exception:
-            return -1
-        finally:
-            if self.preprocessed and os.path.exists(self.preprocessed):
-                try:
-                    os.unlink(self.preprocessed)
-                except Exception:
-                    pass
+            pass
+        return ""
 
-    def build_expr_trees_from_all_ast_item(self, x_item):
+    def _get_real_location(self, cursor):
         """
-        all_AST() の結果 x の 1要素（例: x[0]={orig_line:[Cursor(BINARY_OPERATOR)...],...}）から、
-        {operator, A, B, kakko} を持つ式木のリストを返す。
+        cursor.location はプリプロセス後ファイルを指すことがある。
+        preproc_map を使って「実ソース側 (file,line)」に寄せる。
+        """
+        try:
+            loc = cursor.location
+            if not loc or not loc.file:
+                return None, None, None
+            file_path = str(loc.file)
+            line_no = int(loc.line)
+            col_no = int(loc.column)
+            # プリプロセス一時ファイルなら preproc_map で実ソースへ
+            if self.preprocessed and os.path.abspath(file_path) == os.path.abspath(self.preprocessed):
+                mapped = self.preproc_map.get(line_no)
+                if mapped:
+                    # col はそのまま（厳密な列変換は困難なので tokenize で補正する方針）
+                    file_path, line_no = mapped
+            return file_path, line_no, col_no
+        except Exception:
+            return None, None, None
 
-        仕様:
-          - leaf は {"type","text"} のみ（kakko は持たせない）
-          - node は {"operator","A","B","type","kakko"}（kakko はこの二項式が括弧で囲まれているか）
-            例: (a + b) の '+' ノード -> kakko=True
+    def _safe_tokenize(self, cursor):
         """
-        if not x_item or not isinstance(x_item, dict):
+        仕様A/B/D: tokenize 必須。失敗時は空。
+        """
+        try:
+            return list(cursor.get_tokens())
+        except Exception:
             return []
 
-        def _token_text(n):
+    def _token_cols(self, tok):
+        """
+        token の begin/end 列(1始まり)を返す。
+        clang token は end が取れない場合があるので spelling 長で推定する。
+        """
+        try:
+            b = tok.extent.start.column
+        except Exception:
+            b = None
+        try:
+            e = tok.extent.end.column
+        except Exception:
+            e = None
+        if b is None:
+            return None, None
+        if e is None:
+            # end が無い場合: 文字数推定（Cのtokenは概ねこれでOK）
+            e = b + max(len(getattr(tok, "spelling", "") or ""), 1) - 1
+        return int(b), int(e)
+
+    def _cursor_kind_is_function_call_head(self, cursor) -> bool:
+        try:
+            return cursor.kind == cindex.CursorKind.CALL_EXPR
+        except Exception:
+            return False
+
+    def _format_call_expr(self, call_cursor) -> str:
+        """
+        仕様: funcName(arg1, arg2, ...) 形式。
+        引数は AST の引数ノード単位で spelling を使う（a+b は 1引数として保持）。
+        """
+        try:
+            fname = call_cursor.spelling or ""
+            args = []
+            for ch in call_cursor.get_children():
+                # CALL_EXPR の子: 関数参照 + 引数... なので、最初の子を除外するのが無難
+                args.append(ch.spelling)
+            # 先頭が関数名参照っぽい場合は除去（重複回避）
+            if args and (args[0] == fname or args[0] == "" or args[0].endswith(fname)):
+                args = args[1:]
+            return f"{fname}(" + ", ".join([a for a in args if a is not None]) + ")"
+        except Exception:
+            return (call_cursor.spelling or "") + "(...)"
+
+    def _extract_identifier_at(self, line: str, col_1based: int) -> str:
+        """
+        実ソース行の col を起点に識別子を切り出す（macro 判定用）。
+        col が式先頭を指している想定。空白はスキップ。
+        """
+        if not line:
+            return ""
+        i = max(col_1based - 1, 0)
+        n = len(line)
+        while i < n and line[i] in [' ', '\t']:
+            i += 1
+        if i >= n:
+            return ""
+        # identifier: [A-Za-z_][A-Za-z0-9_]*
+        if not (line[i].isalpha() or line[i] == "_"):
+            return ""
+        j = i + 1
+        while j < n and (line[j].isalnum() or line[j] == "_"):
+            j += 1
+        return line[i:j]
+
+    # --- macro table ------------------------------------------------------
+
+    def _parse_macro_definition(self, cursor):
+        """
+        MacroTable 要素を作る（簡易）。
+        kind: object=0 / function=1
+        func_op: 関数マクロ引数名リスト（取れない場合は []）
+        """
+        try:
+            name = cursor.spelling or ""
+            toks = self._safe_tokenize(cursor)
+            if not name:
+                return None
+
+            spellings = [t.spelling for t in toks if getattr(t, "spelling", None) is not None]
+            # ざっくり: name の次が "(" なら関数マクロとみなす
+            kind = 0
+            func_op = []
+            val = ""
+
+            # "name" の位置
             try:
-                return "".join([t.spelling for t in n.get_tokens()]).strip()
-            except Exception:
-                return ""
+                i = spellings.index(name)
+            except ValueError:
+                i = 0
 
-        def is_wrapped_by_single_outer_parens(cursor) -> bool:
-            """
-            cursor.extent のトークン列が、単一の最外括弧 (...) で全体が包まれているか判定する。
-            例: "(a+b)" -> True, "a+(b)" -> False, "((a))" -> True（外側は1組として判定）
-            """
-            try:
-                if cursor is None:
-                    return False
-                tu = getattr(cursor, "translation_unit", None)
-                ex = getattr(cursor, "extent", None)
-                if tu is None or ex is None:
-                    return False
-
-                toks = [t.spelling for t in tu.get_tokens(extent=ex)]
-                # デバッグしたいならこの print を残す/必要に応じてコメントアウト
-                # print("toks=", toks)
-
-                if len(toks) < 2 or toks[0] != "(" or toks[-1] != ")":
-                    return False
-
-                depth = 0
-                for i, s in enumerate(toks):
+            if i + 1 < len(spellings) and spellings[i + 1] == "(":
+                kind = 1
+                # 引数抽出 (name ( a , b ) val...)
+                k = i + 2
+                cur = []
+                depth = 1
+                while k < len(spellings) and depth > 0:
+                    s = spellings[k]
                     if s == "(":
                         depth += 1
                     elif s == ")":
                         depth -= 1
-                        # 外側の括弧が末尾より前で閉じたら NG
-                        if depth == 0 and i != len(toks) - 1:
-                            return False
+                        if depth == 0:
+                            if cur:
+                                func_op.append("".join(cur).strip())
+                            break
+                    elif depth == 1 and s == ",":
+                        func_op.append("".join(cur).strip())
+                        cur = []
+                    else:
+                        cur.append(s)
+                    k += 1
+                # 残りが val
+                val = " ".join(spellings[k + 1:]).strip()
+            else:
+                # オブジェクトマクロ: name の後ろ全部が val
+                val = " ".join(spellings[i + 1:]).strip()
 
-                return depth == 0
-            except Exception:
-                return False
+            return {
+                "name": name,
+                "kind": kind,
+                "val": val,
+                "func_op": func_op if kind == 1 else [],
+                "name_length": len(name),
+            }
+        except Exception:
+            return None
 
-        def _has_outer_paren_expr(n) -> bool:
-            try:
-                return is_wrapped_by_single_outer_parens(n)
-            except Exception:
-                return False
+    # --- makeLineMacroData (pre/post) ------------------------------------
 
-        def _op_symbol_between(cur, lhs, rhs):
-            fallback_txt = _token_text(cur)
-            try:
-                if cur is None or lhs is None or rhs is None:
-                    raise ValueError("missing operands")
+    def makeLineMacroData(self, pre_line: str, post_line: str, macroTable: list):
+        """
+        仕様: postベースの展開領域 (post_col_start/end: 1始まり) を返す。
+        失敗時は握って [] を返す。
+        """
+        results = []
+        pre_col = 0
+        post_col = 0
 
-                l_end = int(lhs.extent.end.offset)
-                r_start = int(rhs.extent.start.offset)
-                if l_end >= r_start:
-                    raise ValueError("invalid extent order")
+        # lookup
+        macro_by_name = {m.get("name"): m for m in (macroTable or [])}
 
-                ops = []
-                for t in cur.get_tokens():
-                    try:
-                        off = int(t.location.offset)
-                    except Exception:
-                        continue
-                    if l_end <= off < r_start:
-                        ops.append(t.spelling)
+        try:
+            while pre_col < len(pre_line) and post_col < len(post_line):
+                if pre_line[pre_col] == post_line[post_col]:
+                    pre_col += 1
+                    post_col += 1
+                    continue
 
-                if ops:
-                    mid = "".join(ops).strip()
-                    m = re.search(r'(>>|<<|==|!=|<=|>=|\|\||&&|\+|-|\*|/|%|=)', mid)
-                    if m:
-                        return m.group(1)
+                # 不一致: pre_line から macro 名抽出（区切りまで）
+                start = pre_col
+                while pre_col < len(pre_line) and pre_line[pre_col] not in self._DELIMS:
+                    pre_col += 1
+                target_macro = pre_line[start:pre_col]
+                if not target_macro or target_macro not in macro_by_name:
+                    # 仕様: try/catchで握って終了してよい
+                    break
 
-                m2 = re.findall(r'(>>|<<|==|!=|<=|>=|\|\||&&|\+|-|\*|/|%|=)', fallback_txt)
-                return m2[-1] if m2 else ""
-            except Exception:
-                m2 = re.findall(r'(>>|<<|==|!=|<=|>=|\|\||&&|\+|-|\*|/|%|=)', fallback_txt)
-                return m2[-1] if m2 else ""
+                m = macro_by_name[target_macro]
+                r_data = {"macro_name": target_macro, "post_col_start": post_col + 1}
 
-        def _unwrap(n):
-            try:
-                if n is None:
-                    return None
-                while n is not None and n.kind in (cindex.CursorKind.PAREN_EXPR, cindex.CursorKind.UNEXPOSED_EXPR):
-                    ch = list(n.get_children())
-                    if len(ch) != 1:
-                        break
-                    n = ch[0]
-                return n
-            except Exception:
-                return n
-
-        def _is_simple_term_text(s: str) -> bool:
-            if not s:
-                return False
-            s = s.strip()
-
-            # "->" を含む場合は '-' があっても「メンバ参照」として扱い、ここでは False にしない
-            # （ただし他の演算子や括弧などが含まれる場合は従来通り False）
-            s2 = s.replace("->", "")
-
-            # 追加: 配列アクセス a[20], b[10] を許容するため、"[...]" を全て除去して判定する
-            # 例: "a[20]" -> "a", "arr[i+1]" -> "arr"（中身は問わず除去）
-            s2 = re.sub(r"\[[^\]]*\]", "", s2)
-            
-            # "." は元から許可（regexに含めない）
-            if re.search(r'[\(\)\+\-\*/%=\[\],<>]', s2):
-                return False
-            return True
-
-        def _leaf(n):
-            n2 = _unwrap(n)
-            t = ""
-            s = ""
-            try:
-                t = (self.get_expr_type(n2) or "").strip()
-            except Exception:
-                t = ""
-            try:
-                s = (self.get_expr_name(n2) or "").strip()
-            except Exception:
-                s = ""
-            if not s:
-                s = _token_text(n2)
-            if not t:
-                t = "x"
-            print("s = ", s)
-            s = s.strip()
-            if not _is_simple_term_text(s):
-                tok = _token_text(n2).strip()
-                if _is_simple_term_text(tok):
-                    s = tok
+                # post_col_end 決定
+                if int(m.get("kind", 0)) == 0:
+                    # object macro: val と一致する最初の範囲を探す
+                    val = m.get("val", "")
+                    if val:
+                        idx = post_line.find(val, post_col)
+                        if idx >= 0:
+                            end0 = idx + len(val) - 1
+                            r_data["post_col_end"] = end0 + 1
+                            post_col = end0
+                        else:
+                            # 見つからない場合は次の区切りまで
+                            k = post_col
+                            while k < len(post_line) and post_line[k] not in self._DELIMS:
+                                k += 1
+                            r_data["post_col_end"] = k
+                            post_col = max(k - 1, post_col)
+                    else:
+                        r_data["post_col_end"] = post_col + 1
                 else:
-                    s = (getattr(n2, "spelling", "") or tok or "x").strip()
-                    if not _is_simple_term_text(s):
-                        s = "x"
-                        t = "x"
-            print("s2 = ", s)
-            # op: 変数=0 / マクロで定義した変数=1 / 関数=2 / 定数=3 / それ以外=4
-            def _classify_op(cursor, text: str) -> int:
+                    # function macro: 括弧バランスで範囲確定
+                    k = post_col
+                    # '(' を探す
+                    while k < len(post_line) and post_line[k] != "(" and post_line[k] not in [';', ',', ')']:
+                        k += 1
+                    if k < len(post_line) and post_line[k] == "(":
+                        depth = 0
+                        while k < len(post_line):
+                            if post_line[k] == "(":
+                                depth += 1
+                            elif post_line[k] == ")":
+                                depth -= 1
+                                if depth == 0:
+                                    r_data["post_col_end"] = k + 1
+                                    post_col = k
+                                    break
+                            k += 1
+                        else:
+                            r_data["post_col_end"] = min(len(post_line), post_col + 1)
+                    else:
+                        # '(' が無い: 次の区切りまで
+                        k2 = post_col
+                        while k2 < len(post_line) and post_line[k2] not in self._DELIMS:
+                            k2 += 1
+                        r_data["post_col_end"] = k2
+                        post_col = max(k2 - 1, post_col)
+
+                results.append(r_data)
+
+                # [7] increment
+                pre_col += 1
+                post_col += 1
+        except Exception:
+            return []
+
+        return results
+
+    def makeLineMacroData_pre(self, pre_line: str, macroTable: list):
+        """
+        仕様: preベースのマクロ呼び出し領域 (pre_col_start/end: 1始まり) を返す。
+        除外判定に使う。
+        """
+        results = []
+        if not pre_line:
+            return results
+        names = [m.get("name") for m in (macroTable or []) if m.get("name")]
+        if not names:
+            return results
+
+        # identifier を走査して macro name が出たら範囲を確定
+        i = 0
+        n = len(pre_line)
+        while i < n:
+            ch = pre_line[i]
+            if ch.isalpha() or ch == "_":
+                j = i + 1
+                while j < n and (pre_line[j].isalnum() or pre_line[j] == "_"):
+                    j += 1
+                ident = pre_line[i:j]
+                if ident in names:
+                    # object macro: ident 範囲
+                    pre_start = i + 1
+                    pre_end = j
+                    # function macro: ident 〜 対応する ) まで
+                    m = next((x for x in macroTable if x.get("name") == ident), None)
+                    if m and int(m.get("kind", 0)) == 1:
+                        k = j
+                        while k < n and pre_line[k] in [' ', '\t']:
+                            k += 1
+                        if k < n and pre_line[k] == "(":
+                            depth = 0
+                            while k < n:
+                                if pre_line[k] == "(":
+                                    depth += 1
+                                elif pre_line[k] == ")":
+                                    depth -= 1
+                                    if depth == 0:
+                                        pre_end = k + 1
+                                        break
+                                k += 1
+                        else:
+                            # '(' 無し: 次の区切りまで
+                            k2 = j
+                            while k2 < n and pre_line[k2] not in self._DELIMS:
+                                k2 += 1
+                            pre_end = k2
+                    results.append({"macro_name": ident, "pre_col_start": pre_start, "pre_col_end": pre_end})
+                i = j
+            else:
+                i += 1
+        return results
+
+    def _is_in_macro_region_pre(self, operator_col: int, macroLineData_pre: list) -> bool:
+        for r in macroLineData_pre or []:
+            try:
+                if int(r["pre_col_start"]) <= int(operator_col) <= int(r["pre_col_end"]):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    # --- all_AST ----------------------------------------------------------
+
+    def all_AST(self, analyzeInfo: dict) -> dict:
+        """
+        CodeAnalyzer.md: all_AST
+        TU の子を走査して macroTable を構築し、対象行 child に対し func_walk を呼ぶ。
+        """
+        line = int(analyzeInfo.get("line", 0) or 0)
+        pre_line = self._read_src_line(self.src_file, line)
+        src_abs = os.path.abspath(self.src_file) if self.src_file else None
+
+        self._dbg("all_AST enter", f"line={line}", f"src={self.src_file}", f"src_abs={src_abs}", f"pre_line={pre_line!r}")
+        self._dbg("analyzeInfo", analyzeInfo)
+
+        def _empty():
+            out = {
+                "analizeID": analyzeInfo.get("data", {}).get("analizeID"),
+                "line": line,
+                "spelling": pre_line,
+                "chenge_spelling": pre_line,
+                "eval_datas": [],
+            }
+            self._dbg("all_AST empty return", out)
+            return out
+
+        tu = getattr(self, "tu", None)
+        self._dbg("tu is None?", tu is None)
+        if tu is None:
+            return _empty()
+
+        # まず macroTable は TU直下から集める（量が多いのでここは従来のまま）
+        macroTable = []
+        try:
+            for child in tu.cursor.get_children():
                 try:
-                    txt = (text or "").strip()
-                    if not txt:
-                        return "None"
-
-                    # 定数
-                    if cursor is not None and getattr(cursor, "kind", None) == cindex.CursorKind.INTEGER_LITERAL:
-                        return "Constant"
-                    if re.fullmatch(r'(0[xX][0-9A-Fa-f]+|0[0-7]*|[0-9]+)([uUlL]{0,3})', txt):
-                        return "Constant"
-
-                    # 関数（呼び出し）
-                    if cursor is not None and getattr(cursor, "kind", None) == cindex.CursorKind.CALL_EXPR:
-                        return "Function"
-                    # 簡易フォールバック: foo(...)
-                    if re.match(r'^[A-Za-z_]\w*\s*\(.*\)$', txt):
-                        return "Function"
-
-                    # マクロ（事前にマクロテーブルがある場合だけ 1）
-                    macro_table = getattr(self, "_macro_table", None)
-                    if isinstance(macro_table, dict) and txt in macro_table:
-                        return "Macro"
-
-                    # 変数（識別子のみ）
-                    if re.fullmatch(r'[A-Za-z_]\w*', txt):
-                        return "Variable"
-
-                    return "Other"
-                except Exception:
-                    return "Other"
-
-            op = _classify_op(n2, s)
-
-            # 追加: op が Function の場合、type が "ret (args...)" の形式なら ret のみ残す
-            # 例: "u8 (u8, i8)" -> "u8"
-            if op == "Function":
-                try:
-                    # 先頭から最初の '(' までを返り値型として採用
-                    i = t.find("(")
-                    if i > 0:
-                        t = t[:i].strip()
+                    if child.kind == cindex.CursorKind.MACRO_DEFINITION:
+                        m = self._parse_macro_definition(child)
+                        if m:
+                            macroTable.append(m)
+                            if len(macroTable) <= 10:
+                                self._dbg("macro add", m.get("name"), "kind", m.get("kind"))
                 except Exception:
                     pass
+        except Exception:
+            pass
 
-            # leaf は kakko を持たない（代わりに op/sub を持たせる）
-            return {"type": t, "text": s, "op": op, "sub": ""}
+        # 重要: TU全体を preorder で走査して、file+line 一致の「行の中のノード」を拾う
+        visited = 0
+        matched = 0
+        picked = None
 
-        # 追加: 式木から行内の leaf を集めて ["name","type"] を作る
-        def _is_name_or_const(txt: str) -> bool:
-            if not txt:
+        try:
+            for node in tu.cursor.walk_preorder():
+                visited += 1
+
+                f, ln, col = self._get_real_location(node)
+                if ln != line:
+                    continue
+
+                f_abs = os.path.abspath(f) if f else None
+                if src_abs and f_abs and f_abs != src_abs:
+                    continue
+
+                # 同じ行に複数ノードがあるので、とりあえず「その行の Statement/Expr っぽいもの」を優先
+                matched += 1
+                if picked is None:
+                    picked = node
+                else:
+                    try:
+                        # より内側（深い）を優先するため、token が取れる/長い方を採用
+                        a = len(self._safe_tokenize(picked))
+                        b = len(self._safe_tokenize(node))
+                        if b >= a:
+                            picked = node
+                    except Exception:
+                        pass
+
+                if matched <= 5:
+                    self._dbg_cursor("line-matched node", node)
+        except Exception as e:
+            self._dbg("walk_preorder exception", e)
+
+        self._dbg("walk_preorder done", f"visited={visited}", f"matched={matched}", f"picked={'yes' if picked else 'no'}")
+
+        if picked is None:
+            return _empty()
+
+        # picked を起点に func_walk（ここで + の候補が拾えるはず）
+        try:
+            out = self.func_walk(picked, analyzeInfo, macroTable, pre_line=pre_line)
+            self._dbg("func_walk returned", "eval_datas_len", len(out.get("eval_datas", [])))
+            return out
+        except Exception as e:
+            self._dbg("func_walk exception", e)
+            return _empty()
+
+    # --- func_walk --------------------------------------------------------
+
+    def _all_cols_in_src(self, line_str: str, token_spelling: str) -> list:
+        """line_str 中の token_spelling 出現列(1-based)を昇順で返す。"""
+        if not line_str or not token_spelling:
+            return []
+        cols = []
+        start = 0
+        while True:
+            k = line_str.find(token_spelling, start)
+            if k < 0:
+                break
+            cols.append(k + 1)
+            # 重なり検出を避ける（例: '>>' を 1文字ずつずらして誤検出しない）
+            start = k + max(len(token_spelling), 1)
+        return cols
+
+    def _extract_expr_around_operator(self, line_str: str, operator_col_1based: int) -> str:
+        """
+        実ソース行から operator_col を中心に `lhs op rhs` を切り出す（マクロ展開に依存しない）。
+
+        仕様:
+          - 対象は **2項演算子** 1個分（同一深度の次の2項演算子は含めない）
+            例: a + b + c の 1個目 '+' → "a + b"
+                a + b * c の '+'       → "a + b"
+          - 括弧は一塊: a + (b + c) の '+' → "a + (b + c)"
+          - 引数区切り ',' は境界（同一深度で ',' に当たったら止める）
+            例: f(EFGHIJK + a, b) の '+' → "EFGHIJK + a"
+          - 複数文字の2項演算子 (==, <=, >=, !=, &&, ||, <<, >>, +=, -=, *=, /=, %=, &=, |=, ^=, <<=, >>= など) に対応
+          - 評価順/優先順位は厳密に追わない（境界切り出しのみ）
+        """
+        if not line_str or operator_col_1based <= 0:
+            return ""
+
+        s = line_str
+        n = len(s)
+        op_i = operator_col_1based - 1
+        if op_i < 0 or op_i >= n:
+            return ""
+
+        # --- 演算子候補（長いもの優先）---
+        OPS_3 = {"<<=", ">>="}
+        OPS_2 = {
+            "==", "!=", "<=", ">=",
+            "&&", "||",
+            "<<", ">>",
+            "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
+            "->",
+        }
+        OPS_1 = set(list("+-*/%&|^<>!=?:"))
+
+        STOP_CHARS = set(list(";,"))
+        ARG_SEP = ","
+        OPEN_CHARS = set(list("([{"))
+
+        def _peek_op_at(pos: int) -> str:
+            """pos を先頭として演算子文字列（最大3文字）を返す。無ければ ''。"""
+            if pos < 0 or pos >= n:
+                return ""
+            if pos + 3 <= n and s[pos:pos + 3] in OPS_3:
+                return s[pos:pos + 3]
+            if pos + 2 <= n and s[pos:pos + 2] in OPS_2:
+                return s[pos:pos + 2]
+            if s[pos] in OPS_1:
+                return s[pos]
+            return ""
+
+        def _is_unary_pm(pos: int, op_str: str) -> bool:
+            """
+            '+' or '-' が単項っぽい場合 True（rhs 境界として扱わない）。
+            厳密でなくていいので、直前非空白が演算子/区切り/開き括弧なら単項とみなす。
+            """
+            if op_str not in {"+", "-"}:
                 return False
-            if re.fullmatch(r'[A-Za-z_]\w*', txt):
+            k = pos - 1
+            while k >= 0 and s[k] in " \t":
+                k -= 1
+            if k < 0:
                 return True
-            if re.fullmatch(r'(0[xX][0-9A-Fa-f]+|0[0-7]*|[0-9]+)([uUlL]{0,3})', txt):
+            prev = s[k]
+            if prev in STOP_CHARS or prev in OPEN_CHARS or prev == ARG_SEP:
+                return True
+            if _peek_op_at(k):
+                return True
+            if prev in "=!?:":  # ざっくり
                 return True
             return False
 
-        def _collect_line_type_pairs(tree_or_leaf, out_list):
-            if tree_or_leaf is None:
-                return
-            if isinstance(tree_or_leaf, dict) and "operator" in tree_or_leaf:
-                _collect_line_type_pairs(tree_or_leaf.get("A"), out_list)
-                _collect_line_type_pairs(tree_or_leaf.get("B"), out_list)
-                return
-            if isinstance(tree_or_leaf, dict) and "text" in tree_or_leaf:
-                name = (tree_or_leaf.get("text") or "").strip()
-                typ = (tree_or_leaf.get("type") or "").strip() or "x"
-                if _is_name_or_const(name):
-                    out_list.append([name, typ])
-                return
+        # --- operator本体(文字列長)を確定（開始列は operator_col_1based 前提）---
+        op_str_here = _peek_op_at(op_i)
+        if not op_str_here:
+            # operator_col が 2文字目を指していた等のズレ救済
+            if op_i - 1 >= 0:
+                op_str_here = _peek_op_at(op_i - 1)
+                if op_str_here and len(op_str_here) >= 2:
+                    op_i = op_i - 1
+        op_len = len(op_str_here) if op_str_here else 1
 
-        def _build(cur):
-            if cur is None:
-                return None
+        # --- 左側開始探索（同一深度での直前演算子/区切りの直後）---
+        i = op_i - 1
+        while i >= 0 and s[i] in " \t":
+            i -= 1
 
-            # DEBUG (around line 513): いまチェックしている cur を出力
-            #try:
-            #    loc = getattr(cur, "location", None)
-            #    file_name = getattr(getattr(loc, "file", None), "name", None) if loc else None
-            #    line_no = getattr(loc, "line", None) if loc else None
-            #    col_no = getattr(loc, "column", None) if loc else None
-            #    kind = getattr(cur, "kind", None)
-            #    txt = _token_text(cur)
-            #    #print(f"[DEBUG][_build] cur.kind={kind} loc={file_name}:{line_no}:{col_no} text={txt!r}")
-            #except Exception:
-            #    pass
+        depth_paren = depth_brack = depth_brace = 0
+        left_start = 0
 
-            # この二項式自体が (...) で包まれているか（unwrap 前に判定）
-            node_kakko = _has_outer_paren_expr(cur)
+        while i >= 0:
+            ch = s[i]
 
-            cur_u = _unwrap(cur)
-            if cur_u is None:
-                return None
+            # 左方向の深度更新（逆走査）
+            if ch == ")":
+                depth_paren += 1
+            elif ch == "(":
+                if depth_paren > 0:
+                    depth_paren -= 1
+                else:
+                    # ★深度0の '(' は「呼び出し/キャスト/グルーピングの開始」。
+                    # 今回の f(EFGHIJK + a, b) のようなケースで lhs を f( から切り離す。
+                    left_start = i + 1
+                    break
+            elif ch == "]":
+                depth_brack += 1
+            elif ch == "[":
+                if depth_brack > 0:
+                    depth_brack -= 1
+            elif ch == "}":
+                depth_brace += 1
+            elif ch == "{":
+                if depth_brace > 0:
+                    depth_brace -= 1
 
-            # 追加: (int)(a+b) のような明示キャストは、キャスト「中身」を build 対象にする
-            # 例: CSTYLE_CAST_EXPR の子に BINARY_OPERATOR が居ればそれを辿る
-            if cur_u.kind == cindex.CursorKind.CSTYLE_CAST_EXPR:
+            if depth_paren == 0 and depth_brack == 0 and depth_brace == 0:
+                # ★引数区切り
+                if ch == ARG_SEP:
+                    left_start = i + 1
+                    break
+
+                # 文/代入境界
+                if ch in ";=":
+                    left_start = i + 1
+                    break
+
+                # 「この位置を末尾とする」演算子(2/3文字)も境界にする
+                prev2 = s[i - 1:i + 1] if i - 1 >= 0 else ""
+                prev3 = s[i - 2:i + 1] if i - 2 >= 0 else ""
+
+                op_end = ""
+                if prev3 in OPS_3:
+                    op_end = prev3
+                    op_begin = i - 2
+                elif prev2 in OPS_2:
+                    op_end = prev2
+                    op_begin = i - 1
+                else:
+                    op1 = _peek_op_at(i)
+                    if op1 and len(op1) == 1:
+                        op_end = op1
+                        op_begin = i
+                    else:
+                        op_begin = None
+
+                if op_end:
+                    if op_end in {"+", "-"} and _is_unary_pm(op_begin, op_end):
+                        i -= 1
+                        continue
+                    left_start = op_begin + len(op_end)
+                    break
+
+            i -= 1
+
+        while left_start < n and s[left_start] in " \t":
+            left_start += 1
+
+        # --- 右側終了探索（同一深度での次演算子/区切り/閉じ括弧直前）---
+        j = op_i + op_len
+        while j < n and s[j] in " \t":
+            j += 1
+
+        depth_paren = depth_brack = depth_brace = 0
+        right_end = n  # exclusive
+
+        while j < n:
+            ch = s[j]
+
+            # 右方向の深度更新（順走査）
+            if ch == "(":
+                depth_paren += 1
+            elif ch == ")":
+                if depth_paren > 0:
+                    depth_paren -= 1
+                else:
+                    # 呼び出し引数の終端など（深度0で閉じ括弧に当たったらそこで止める）
+                    right_end = j
+                    break
+            elif ch == "[":
+                depth_brack += 1
+            elif ch == "]":
+                if depth_brack > 0:
+                    depth_brack -= 1
+                else:
+                    right_end = j
+                    break
+            elif ch == "{":
+                depth_brace += 1
+            elif ch == "}":
+                if depth_brace > 0:
+                    depth_brace -= 1
+                else:
+                    right_end = j
+                    break
+
+            if depth_paren == 0 and depth_brack == 0 and depth_brace == 0:
+                # ★引数区切り
+                if ch == ARG_SEP:
+                    right_end = j
+                    break
+
+                # 文終端/区切り
+                if ch in STOP_CHARS:
+                    right_end = j
+                    break
+
+                # 次の2項演算子で止める
+                op_next = _peek_op_at(j)
+                if op_next:
+                    if op_next in {"+", "-"} and _is_unary_pm(j, op_next):
+                        j += 1
+                        continue
+                    right_end = j
+                    break
+
+            j += 1
+
+        return s[left_start:right_end].strip()
+
+    def func_walk(self, child, analyzeInfo: dict, macroTable: list, pre_line: str = "") -> dict:
+        """
+        CodeAnalyzer.md: func_walk
+        - child を 1回走査し、BinaryOperator/CompoundAssignOperator の候補を収集
+        - operator/exitcolnum で target を確定
+        - getTargetInfo で eval_info を作り r.eval_datas に入れる
+        """
+        line = int(analyzeInfo.get("line", 0) or 0)
+        op = analyzeInfo.get("data", {}).get("op", {}) or {}
+        target_operator = op.get("operator", "")
+        exitnum = int(op.get("operator_exitcolnum", 1) or 1)
+
+        self._dbg("func_walk enter", f"line={line}", f"target_operator={target_operator!r}", f"exitnum={exitnum}")
+        self._dbg_cursor("func_walk root child", child)
+
+        r = {
+            "analizeID": analyzeInfo.get("data", {}).get("analizeID"),
+            "line": line,
+            "spelling": pre_line,
+            "chenge_spelling": pre_line,
+            "eval_datas": [],
+        }
+
+        macroLineData_pre = self.makeLineMacroData_pre(pre_line, macroTable)
+        self._dbg("macroLineData_pre", macroLineData_pre)
+
+        # 追加: pre_line 上の target_operator の出現列（これが“本当の列”）
+        src_op_cols = self._all_cols_in_src(pre_line, target_operator)
+        self._dbg("src_op_cols", src_op_cols)
+
+        candidates = []
+        seen_same_col = {}  # token列が同じ候補が複数ある場合のインデックス付け
+
+        def walk_once(cur):
+            stack = [cur]
+            visited = 0
+            while stack:
+                node = stack.pop()
+                visited += 1
+
                 try:
-                    ch_cast = list(cur_u.get_children())
-                    # 一般的には [TYPE_REF or TYPEDEF_DECL..., <expr>] のように並ぶので、
-                    # 最後の「式」側の子を優先して辿る
-                    expr_child = ch_cast[-1] if ch_cast else None
-                    if expr_child is not None:
-                        return _build(expr_child)
+                    k = node.kind
+                except Exception:
+                    k = None
+
+                is_bin = (k == cindex.CursorKind.BINARY_OPERATOR)
+                is_cas = (k == cindex.CursorKind.COMPOUND_ASSIGNMENT_OPERATOR)
+
+                if (is_bin or is_cas) and target_operator:
+                    try:
+                        if (node.spelling or "") == target_operator:
+                            self._dbg_cursor("candidate node", node)
+                            self._dbg_tokens("candidate node", node, limit=60)
+
+                            tok_col = self._get_operator_col_from_tokens(node, target_operator)
+                            self._dbg("operator_col_from_tokens", tok_col)
+
+                            if tok_col is not None:
+                                in_macro = self._is_in_macro_region_pre(tok_col, macroLineData_pre)
+                                self._dbg("in_macro_region?", in_macro)
+                                if not in_macro:
+                                    # ★ここが重要: token列が同じ候補を区別して、pre_line上のN個目の列を割り当てる
+                                    idx = seen_same_col.get(tok_col, 0)
+                                    seen_same_col[tok_col] = idx + 1
+                                    src_col = src_op_cols[idx] if idx < len(src_op_cols) else None
+
+                                    candidates.append({
+                                        "child": node,
+                                        "col": tok_col,          # 旧: 展開後列（参考）
+                                        "src_col": src_col,      # 新: 実ソース(pre_line)列（これで選ぶ）
+                                        "src_index": idx + 1,    # 1-based: 何個目の'+'
+                                    })
+                    except Exception:
+                        pass
+
+                try:
+                    stack.extend(list(node.get_children()))
                 except Exception:
                     pass
-                # 子が取れない場合はフォールバックで leaf 化
-                return _leaf(cur)
 
-            if cur_u.kind != cindex.CursorKind.BINARY_OPERATOR:
-                return _leaf(cur)
+            self._dbg("walk_once done", f"visited={visited}", f"candidates={len(candidates)}")
 
-            ch = list(cur_u.get_children())
-            lhs_raw = ch[0] if len(ch) >= 1 else None
-            rhs_raw = ch[1] if len(ch) >= 2 else None
+        walk_once(child)
 
-            lhs = _unwrap(lhs_raw)
-            rhs = _unwrap(rhs_raw)
+        # ★ソートは src_col 優先（None は末尾）
+        candidates.sort(key=lambda x: (x.get("src_col") is None, x.get("src_col", 10**9)))
+        self._dbg("candidates sorted src_cols", [(c.get("src_col"), c.get("src_index")) for c in candidates])
 
-            # 追加: lhs/rhs がキャスト式なら、その中身を辿って build する（leaf に潰さない）
-            if lhs is not None and lhs.kind == cindex.CursorKind.CSTYLE_CAST_EXPR:
-                try:
-                    lhs_cast_children = list(lhs.get_children())
-                    lhs_expr = lhs_cast_children[-1] if lhs_cast_children else None
-                    if lhs_expr is not None:
-                        lhs_raw = lhs_expr
-                        lhs = _unwrap(lhs_raw)
-                except Exception:
-                    pass
-
-            if rhs is not None and rhs.kind == cindex.CursorKind.CSTYLE_CAST_EXPR:
-                try:
-                    rhs_cast_children = list(rhs.get_children())
-                    rhs_expr = rhs_cast_children[-1] if rhs_cast_children else None
-                    if rhs_expr is not None:
-                        rhs_raw = rhs_expr
-                        rhs = _unwrap(rhs_raw)
-                except Exception:
-                    pass
-
-            print("lhs.kind=", lhs.kind)
-            print("rhs.kind=", rhs.kind)
-
-            A = _build(lhs_raw) if lhs is not None and lhs.kind == cindex.CursorKind.BINARY_OPERATOR else _leaf(lhs_raw)
-            B = _build(rhs_raw) if rhs is not None and rhs.kind == cindex.CursorKind.BINARY_OPERATOR else _leaf(rhs_raw)
-
-            print("A=", A)
-            print("B=", B)
-            op = _op_symbol_between(cur_u, lhs, rhs) or ""
-
-            at = (A.get("type", "x") if isinstance(A, dict) else "x") or "x"
-            bt = (B.get("type", "x") if isinstance(B, dict) else "x") or "x"
-            node_type = at if (at != "x" and bt != "x" and at == bt) else "x"
-
-            return {"operator": op, "A": A, "B": B, "type": node_type, "kakko": bool(node_kakko)}
-
-        trees = []
-        spel = ""
-        line_type_table = []
-        print("items = ", x_item.items())  # items は呼び出す
-
-        for orig_ln, obj in x_item.items():
-            if not isinstance(obj, dict):
+        # 追加: src_col が同じ候補は重複なので 1件に絞る（= pre_line 上の + 出現数と合わせる）
+        deduped = []
+        seen_cols = set()
+        for c in candidates:
+            sc = c.get("src_col")
+            if sc is None:
+                deduped.append(c)
                 continue
-            spelling = obj.get("spelling", "")
-            cursors = obj.get("cursors", [])
-            print(spelling)
-            spel = spelling
+            if sc in seen_cols:
+                continue
+            seen_cols.add(sc)
+            deduped.append(c)
 
-            for cursor in cursors or []:
-                t = _build(cursor)
-                if t:
-                    trees.append(t)
-                    _collect_line_type_pairs(t, line_type_table)
+        candidates = deduped
+        self._dbg("candidates deduped src_cols", [(c.get("src_col"), c.get("src_index")) for c in candidates])
 
-        return {"spelling": spel, "trees": trees, "LineTypeTable": line_type_table}
+        if exitnum <= 0 or exitnum > len(candidates):
+            self._dbg("NO TARGET", f"exitnum={exitnum}", f"len(candidates)={len(candidates)}")
+            return r
+
+        # ★選択は “pre_line 上の + のn個目”
+        target_data = candidates[exitnum - 1]
+        self._dbg("target picked", {"src_col": target_data.get("src_col"), "src_index": target_data.get("src_index"), "tok_col": target_data.get("col")})
+
+        eval_info = self.getTargetInfo(target_data, line, macroTable, pre_line=pre_line)
+        self._dbg("getTargetInfo returned None?", eval_info is None)
+
+        if eval_info:
+            r["eval_datas"].append(eval_info)
+            r["chenge_spelling"] = eval_info.get("_chenge_spelling_line", r["chenge_spelling"])
+            # 追加: spelling も置換後にする
+            r["spelling"] = eval_info.get("_spelling_line", r["spelling"])
+            if "_chenge_spelling_line" in r["eval_datas"][0]:
+                r["eval_datas"][0].pop("_chenge_spelling_line", None)
+            if "_spelling_line" in r["eval_datas"][0]:
+                r["eval_datas"][0].pop("_spelling_line", None)
+
+        self._dbg("func_walk return", "eval_datas_len", len(r["eval_datas"]))
+        return r
+
+    def _get_operator_col_from_tokens(self, cursor, operator_spelling: str):
+        toks = self._safe_tokenize(cursor)
+        self._dbg("get_operator_col_from_tokens", f"operator={operator_spelling!r}", f"tokens={len(toks)}", f"cursor_sp={getattr(cursor,'spelling',None)!r}")
+        for t in toks:
+            try:
+                if t.spelling == operator_spelling:
+                    b, _ = self._token_cols(t)
+                    return b
+            except Exception:
+                continue
+        return None
+
+    def _guess_operator_token(self, cursor, operator_col: int) -> str:
+        # token 列から operator_col の token を拾う（保険）
+        toks = self._safe_tokenize(cursor)
+        for t in toks:
+            b, _ = self._token_cols(t)
+            if b == operator_col:
+                return t.spelling
+        return getattr(cursor, "spelling", "") or ""
+
+    def _decide_kind(self, node, pre_line: str, col_1based: int, macroTable: list):
+        """
+        仕様: function → macro → val
+        """
+        # function
+        if self._cursor_kind_is_function_call_head(node):
+            return "function", self._format_call_expr(node)
+
+        # macro: 実ソース行から識別子切り出し
+        ident = self._extract_identifier_at(pre_line, col_1based)
+        if ident:
+            for m in macroTable or []:
+                if m.get("name") == ident:
+                    return "macro", [{"macro_name": m.get("name"), "macro_val": m.get("val")}]
+
+        return "val", None
+
+    def _restore_macros_in_eval(
+        self,
+        pre_line: str,
+        left_col: int,
+        right_col: int,
+        operator_col: int,
+        operator_spelling: str,
+        macroTable: list,
+        left_spelling: str,
+        right_spelling: str,
+    ):
+        """
+        仕様[3.3]: マクロが含まれる場合はマクロ名に戻す。
+        実装は簡易: left_col/right_col 位置の先頭識別子が macro 名なら置換する。
+        """
+        macro_by = {m.get("name"): m for m in (macroTable or []) if m.get("name")}
+        l_ident = self._extract_identifier_at(pre_line, left_col)
+        r_ident = self._extract_identifier_at(pre_line, right_col)
+
+        if l_ident in macro_by:
+            left_spelling = l_ident
+        if r_ident in macro_by:
+            right_spelling = r_ident
+
+        eval_spelling = f"{left_spelling} {operator_spelling} {right_spelling}".strip()
+        return eval_spelling, left_spelling, right_spelling
+
+    def _apply_at1_replace(self, line_str: str, eval_spelling: str, eval_col: int, left_col: int, right_end_col: int) -> str:
+        """
+        置換仕様（更新）:
+        - 代入文 "lhs = rhs;" の場合は、rhs 全体ではなく
+          「対象演算子の式範囲(left_col..right_end_col)」だけを @1 に置換する
+        例:
+          1つ目の '+'（EFGHIJK + compare...）→  s = @1 + (int)b;
+          2つ目の '+'（compare... + (int)b）→ s = EFGHIJK + @1;
+        """
+        if not line_str:
+            return line_str
+
+        # 1) 代入文の rhs 内だけを部分置換（最優先）
+        try:
+            s = line_str.rstrip()
+            semi = ""
+            if s.endswith(";"):
+                semi = ";"
+                s = s[:-1]
+
+            if "=" in s:
+                lhs_raw, rhs_raw = s.split("=", 1)
+
+                lhs_part = lhs_raw.rstrip()
+                # rhs の「line_str上の begin列(1-based)」を求める
+                # 例: "    s = XXX" の '=' は lhs_raw の末尾にあるので、rhs_raw の先頭までの空白分も加味
+                rhs_leading_ws = len(rhs_raw) - len(rhs_raw.lstrip(" \t"))
+                rhs_begin_col = len(lhs_raw) + 1 + rhs_leading_ws + 1  # '=' の次(1-based) + ws + 1-based補正
+                rhs_part = rhs_raw.lstrip(" \t")
+
+                # left_col/right_end_col（line_str全体の列）を rhs_part の index に変換
+                a = left_col - rhs_begin_col
+                b = right_end_col - rhs_begin_col
+
+                # ガード（rhs_part の範囲内に収める）
+                if a < 0:
+                    a = 0
+                if b < 0:
+                    b = 0
+                if a > len(rhs_part):
+                    a = len(rhs_part)
+                if b > len(rhs_part):
+                    b = len(rhs_part)
+
+                if a < b:
+                    new_rhs = rhs_part[:a] + "@1" + rhs_part[b:]
+                else:
+                    # 範囲が壊れている場合は rhs 全体を @1（最終フォールバック）
+                    new_rhs = "@1"
+
+                return f"{lhs_part} = {new_rhs.strip()}{semi}"
+        except Exception:
+            pass
+
+        # 2) 文字列一致で置換（代入文以外）
+        try:
+            idxs = []
+            start = 0
+            while True:
+                k = line_str.find(eval_spelling, start)
+                if k < 0:
+                    break
+                idxs.append(k)
+                start = k + 1
+
+            if idxs:
+                target = idxs[0]
+                for k in idxs:
+                    span_start_col = k + 1
+                    span_end_col = k + len(eval_spelling)
+                    if span_start_col <= eval_col <= span_end_col:
+                        target = k
+                        break
+                return line_str[:target] + "@1" + line_str[target + len(eval_spelling):]
+        except Exception:
+            pass
+
+        # 3) フォールバック: left_col〜right_end_col を @1
+        try:
+            a = max(left_col - 1, 0)
+            b = min(right_end_col, len(line_str))
+            if 0 <= a < b:
+                return line_str[:a] + "@1" + line_str[b:]
+        except Exception:
+            pass
+
+        return line_str
+
+    def _tokens_to_c_expr(self, toks) -> str:
+        """token列をCの見た目に近い形へ整形する（最小）。"""
+        sp = [t.spelling for t in (toks or []) if getattr(t, "spelling", None) is not None]
+        if not sp:
+            return ""
+        out = []
+        for s in sp:
+            if not out:
+                out.append(s)
+                continue
+            prev = out[-1]
+            if s in [")", "]", ",", ";"]:
+                out.append(s)
+            elif prev in ["(", "[", ","]:
+                out.append(s)
+            else:
+                out.append(" " + s)
+        return "".join(out).strip()
+
+    def _src_slice_by_cols(self, line_str: str, begin_col: int, end_col_exclusive: int) -> str:
+        """
+        実ソース行から列(1始まり)で部分文字列取得。
+        end は exclusive（token の end列に合わせる）。
+        """
+        if not line_str:
+            return ""
+        a = max(begin_col - 1, 0)
+        b = max(end_col_exclusive - 1, 0)
+        return line_str[a:b]
+
+    def _c_normalize_min(self, s: str) -> str:
+        """
+        実ソース断片を最小限に正規化する。
+        要求:
+          - 'EFGHIJK + (int)b' の形
+          - ') b' の空白を落とす
+          - '(int) b' も '(int)b' にする
+        """
+        if not s:
+            return s
+        # 連続空白を1つに
+        s = re.sub(r"[ \t]+", " ", s)
+
+        # '( int )' -> '(int)'
+        s = re.sub(r"\(\s*", "(", s)
+        s = re.sub(r"\s*\)", ")", s)
+
+        # '(int) b' / ') b' -> '(int)b' / ')b'（識別子だけでなく数値/式の先頭も対象にする）
+        # 例: ') b' ') 123' ') *p' などを最小限に詰める
+        s = re.sub(r"\)\s+([A-Za-z_0-9\*])", r")\1", s)
+
+        return s.strip()
+
+    # ---------------------------------------------------------------------
+    # Debug helpers（必須：_dbg が無いと AttributeError になる）
+    # ※ 環境変数は使わない。ファイル先頭の DEBUG=1 のときだけ print。
+    # ---------------------------------------------------------------------
+    def _dbg(self, *args):
+        if DEBUG == 1:
+            print("[CodeAnalyzerDBG]", *args)
+
+    def _dbg_cursor(self, label: str, cursor):
+        if DEBUG != 1:
+            return
+        try:
+            f, ln, col = self._get_real_location(cursor)
+        except Exception:
+            f, ln, col = None, None, None
+        try:
+            kind = cursor.kind
+        except Exception:
+            kind = None
+        try:
+            sp = cursor.spelling
+        except Exception:
+            sp = None
+        self._dbg(f"{label}: kind={kind} spelling={sp!r} loc=({f},{ln},{col})")
+
+    def _dbg_tokens(self, label: str, cursor, limit: int = 80):
+        if DEBUG != 1:
+            return
+        toks = self._safe_tokenize(cursor)
+        parts = []
+        for t in toks[:limit]:
+            try:
+                b, e = self._token_cols(t)
+                parts.append(f"{t.spelling}@{b}-{e}")
+            except Exception:
+                parts.append(f"{getattr(t,'spelling',None)}@?")
+        self._dbg(f"{label}: tokens({len(toks)}): " + " ".join(parts) + ("" if len(toks) <= limit else " ..."))
+
+    # 追加: pre_line（マクロ含む実ソース）上での token 位置検索
+    def _find_token_col_in_src(self, line_str: str, token_spelling: str, near_col_1based=None):
+        """実ソース行で token_spelling が現れる列(1始まり)を返す。near_col があれば最寄りを返す。"""
+        if not line_str or not token_spelling:
+            return None
+        hits = []
+        start = 0
+        while True:
+            k = line_str.find(token_spelling, start)
+            if k < 0:
+                break
+            hits.append(k + 1)
+            start = k + 1
+        if not hits:
+            return None
+        if near_col_1based is None:
+            return hits[0]
+        near = int(near_col_1based)
+        return min(hits, key=lambda c: abs(c - near))
+
+    def _extract_lhs_rhs_from_extend(self, expr_extend: str, operator_spelling: str):
+        """'LHS op RHS' を最初の operator_spelling で split。"""
+        if not expr_extend or not operator_spelling or operator_spelling not in expr_extend:
+            return "", ""
+        lhs, rhs = expr_extend.split(operator_spelling, 1)
+        return lhs.strip(), rhs.strip()
+
+    def _lookup_object_macro_value(self, name: str, macroTable: list):
+        """
+        name が macroTable にあればその値を返す。
+        ※要求: left_val_spelling と同名があれば macro 扱いにするため、
+          見つかったが値不明の場合は "" を返す。
+        """
+        if not name or not macroTable:
+            return None
+        for m in macroTable:
+            try:
+                if m.get("name") == name:
+                    v = m.get("val", None)
+                    if v is None:
+                        v = m.get("value", None) or m.get("expansion", None) or m.get("body", None) or m.get("spelling", None)
+                    if v is None:
+                        return ""
+                    return str(v).strip()
+            except Exception:
+                continue
+        return None
+
+    # 置換: 「代入の rhs を丸ごと @1」にしていたのが誤り。
+    # 要求どおり「rhs の中で target_expr だけを @1 に置換」する。
+    def _replace_in_assignment_rhs(self, pre_line: str, target_expr: str, replacement: str) -> str:
+        """
+        pre_line 内の target_expr を replacement に置換する。
+
+        - 代入文 "lhs = rhs;" の場合: rhs 内だけを置換（従来互換）
+        - '=' が無い行でも置換できるようにする（例: '| (a + b)' -> '| (@1)'）
+        - target_expr がそのまま見つからない場合: '(target_expr)' も試す
+        """
+        s = pre_line.rstrip("\n")
+
+        # --- 非代入文: 行全体で柔軟に置換 ---
+        if "=" not in s:
+            if not target_expr:
+                return s
+
+            # 1) そのまま
+            idx = s.find(target_expr)
+            if idx >= 0:
+                return s[:idx] + replacement + s[idx + len(target_expr):]
+
+            # 2) 括弧付き
+            par = f"({target_expr})"
+            idx = s.find(par)
+            if idx >= 0:
+                return s[:idx] + replacement + s[idx + len(par):]
+
+            # 3) 空白正規化なしでは見つからないケース向けに、
+            #    target_expr の空白を潰した版で再探索（軽いフォールバック）
+            try:
+                s2 = re.sub(r"[ \t]+", "", s)
+                t2 = re.sub(r"[ \t]+", "", target_expr)
+                if t2:
+                    k = s2.find(t2)
+                    if k >= 0:
+                        # 元文字列の対応位置復元は難しいので、ここは最後の手段として諦める
+                        # （必要ならトークン単位置換へ）
+                        return s
+            except Exception:
+                pass
+
+            return s
+
+        # --- 代入文: rhs 内だけを置換（従来ロジック）---
+        semi = ""
+        s_strip = s.rstrip()
+        if s_strip.endswith(";"):
+            semi = ";"
+            s_strip = s_strip[:-1]
+
+        lhs_raw, rhs_raw = s_strip.split("=", 1)
+
+        indent = re.match(r"^\s*", lhs_raw).group(0)
+        lhs_name = lhs_raw.strip()
+        rhs_part = rhs_raw.strip()
+
+        # target_expr が rhs に無ければ変更しない（ただし括弧付きも試す）
+        idx = rhs_part.find(target_expr) if target_expr else -1
+        if idx < 0 and target_expr:
+            idx = rhs_part.find(f"({target_expr})")
+            if idx >= 0:
+                target_expr = f"({target_expr})"
+
+        if idx < 0:
+            # 置換できない場合は元の行（整形した形）を返す
+            return f"{indent}{lhs_name} = {rhs_part}{semi}"
+
+        new_rhs = rhs_part[:idx] + replacement + rhs_part[idx + len(target_expr):]
+        new_rhs = re.sub(r"\s*\+\s*", " + ", new_rhs)
+        new_rhs = re.sub(r"\s+", " ", new_rhs).strip()
+
+        r_val = f"{indent}{lhs_name} = {new_rhs}{semi}"
+        self._dbg("r_val:", r_val)
+        return r_val
+
+    def getTargetInfo(self, target_data: dict, line: int, macroTable: list, pre_line: str = ""):
+        cursor = target_data.get("child")
+        self._dbg("cursor:", getattr(cursor, "spelling", None))
+
+        op_str = ""
+        try:
+            op_str = (cursor.spelling or "")
+        except Exception:
+            op_str = ""
+
+        operator_col = target_data.get("src_col")
+        if operator_col is None:
+            operator_col_hint = int(target_data.get("col", 0) or 0)
+            operator_col = self._find_token_col_in_src(pre_line, op_str, near_col_1based=operator_col_hint) or operator_col_hint
+
+        children = list(cursor.get_children())
+        if len(children) < 2:
+            return None
+        left_node = children[0]
+        right_node = children[1]
+
+        # ------------------------------------------------------------------
+        # A) eval_spelling_extend（= 展開前 / 元ソース）
+        # ------------------------------------------------------------------
+        self._dbg("operator_col:", operator_col)
+        raw_target_expr_pre = self._extract_expr_around_operator(pre_line, operator_col).strip()
+        self._dbg("raw_target_expr(pre):", raw_target_expr_pre)
+
+        eval_spelling_extend = self._c_normalize_min(raw_target_expr_pre)
+        self._dbg("eval_spelling_extend(pre,norm):", eval_spelling_extend)
+
+        # ------------------------------------------------------------------
+        # B) eval_spelling（= 展開後）
+        #    ポイント: op_col_tok を「展開後行文字列上の列」に再計算する
+        # ------------------------------------------------------------------
+        # 1) 展開後ファイル上の（プリプロセス後）同一行の文字列を取得する
+        post_line = ""
+        try:
+            # cursor.location はプリプロセス後ファイルを指す想定
+            loc = cursor.location
+            post_file = str(loc.file) if loc and loc.file else None
+            post_ln = int(loc.line) if loc else None
+            if post_file and post_ln:
+                post_line = self._read_src_line(post_file, post_ln)
+        except Exception:
+            post_line = ""
+
+        # 2) token列で得た op の「列」（プリプロセス後ファイル上の列）
+        op_col_tok = self._get_operator_col_from_tokens(cursor, op_str)
+
+        # 3) op_col_tok を「展開後の演算子位置」として確定させる（= 再計算）
+        #    - 基本は post_line に対して op_col_tok を採用 (token column と一致する前提)
+        #    - ただし安全のため検証し、ズレていたら近傍で op_str を探索して補正する
+        op_col_post = None
+        if post_line and op_col_tok is not None:
+            # op_col_tok が指す位置に op_str がいるか軽く確認（1-based）
+            i0 = op_col_tok - 1
+            if 0 <= i0 < len(post_line) and post_line[i0:i0 + len(op_str)] == op_str:
+                op_col_post = op_col_tok
+            else:
+                # 近傍で op_str を探す（最寄りを採用）
+                op_col_post = self._find_token_col_in_src(post_line, op_str, near_col_1based=op_col_tok)
+
+        # ここで要件: 1248行目の op_col_tok は「展開後の演算子位置に再計算」された値にする
+        op_col_tok = op_col_post
+        self._dbg("op_col_tok(recomputed_on_post_line):", op_col_tok)
+
+        # 4) 展開後文字列（post_line）から対象1個分を切り出して eval_spelling にする
+        if post_line and op_col_tok is not None:
+            raw_target_expr_post = self._extract_expr_around_operator(post_line, op_col_tok).strip()
+            eval_spelling = self._c_normalize_min(raw_target_expr_post)
+        else:
+            # フォールバック: 最低限 tokens 文字列から '+' の位置を検索して切る
+            expr_toks = self._safe_tokenize(cursor)
+            tokens_expr = self._tokens_to_c_expr(expr_toks).strip()
+            k = tokens_expr.find(op_str) if (tokens_expr and op_str) else -1
+            if k >= 0:
+                raw_target_expr_post = self._extract_expr_around_operator(tokens_expr, k + 1).strip()
+                eval_spelling = self._c_normalize_min(raw_target_expr_post)
+            else:
+                eval_spelling = ""
+
+        self._dbg("eval_spelling(post,norm):", eval_spelling)
+
+        # ------------------------------------------------------------------
+        # 以降: lhs/rhs・kind 判定など（表示用は元ソース基準のまま）
+        # ------------------------------------------------------------------
+        lhs_pre, rhs_pre = self._extract_lhs_rhs_from_extend(eval_spelling_extend, op_str)
+        self._dbg(" lhs_pre(extend/pre):", lhs_pre)
+        self._dbg(" rhs_pre(extend/pre):", rhs_pre)
+
+        lhs_post, rhs_post = self._extract_lhs_rhs_from_extend(eval_spelling, op_str)
+        self._dbg(" lhs_post(eval/post):", lhs_post)
+        self._dbg(" rhs_post(eval/post):", rhs_post)
+
+        left_val_spelling = lhs_pre.strip()
+        right_val_spelling = rhs_pre.strip()
+
+        left_val_kind = "val"
+        left_kind_op = None
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", left_val_spelling):
+            mv2 = self._lookup_object_macro_value(left_val_spelling, macroTable)
+            if mv2 is not None:
+                left_val_kind = "macro"
+                try:
+                    left_kind_op = int(mv2, 0) if mv2 != "" else None
+                except Exception:
+                    left_kind_op = mv2
+
+        right_val_kind = "val"
+        right_kind_op = None
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", right_val_spelling):
+            mv2 = self._lookup_object_macro_value(right_val_spelling, macroTable)
+            if mv2 is not None:
+                right_val_kind = "macro"
+                try:
+                    right_kind_op = int(mv2, 0) if mv2 != "" else None
+                except Exception:
+                    right_kind_op = mv2
+
+        left_col = self._find_token_col_in_src(pre_line, left_val_spelling, near_col_1based=operator_col - 1) or 1
+        right_col = self._find_token_col_in_src(pre_line, right_val_spelling, near_col_1based=operator_col + 1) or (operator_col + 1)
+
+        spelling = self._replace_in_assignment_rhs(pre_line, raw_target_expr_pre, "@1")
+
+        # 要件: chenge_spelling = eval_spelling_extend
+        # spelling は「@1 を含む行テンプレ」にする
+        spelling = self._replace_in_assignment_rhs(pre_line, raw_target_expr_pre, "@1")
+
+        # chenge_spelling は eval_spelling_extend（式断片のみ）
+        chenge_spelling = eval_spelling_extend
+
+        return {
+            "eval_col": operator_col,
+            "eval_spelling": eval_spelling,                 # 展開後（例: 5 + compare...）
+            "eval_spelling_extend": eval_spelling_extend,   # 展開前（例: EFGHIJK + compare...）
+            "operator_spelling": op_str,
+            "operator_cursor": cursor,
+            "operator_col": operator_col,
+            "left_val_spelling": left_val_spelling,
+            "left_val_cursor_head": left_node,
+            "left_val_kind": left_val_kind,
+            "left_kind_op": left_kind_op,
+            "left_col": left_col,
+            "left_spel_insert_id": 1,
+            "right_val_spelling": right_val_spelling,
+            "right_val_cursor_head": right_node,
+            "right_val_kind": right_val_kind,
+            "right_kind_op": right_kind_op,
+            "right_col": right_col,
+            "right_spel_insert_id": 1,
+            "_chenge_spelling_line": chenge_spelling,
+            "_spelling_line": spelling,
+        }

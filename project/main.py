@@ -394,7 +394,7 @@ def MacroApply(pre_src_line: str, new_src_line: str, line_type_table, ft=None) -
         return out
 
     # --- 変換用テーブル抽出 ---
-    # 変更(最小限): "(type)ident" のキャストは "type" と "ident" に分解せず "(type)ident" として保持する
+    # 変更(最小限): "(type)ident" のキャストは "type" と "ident" に分解0せず "(type)ident" として保持する
     def _extract_table(s: str, normalize_cast_expr: bool = False, drop_leading_type: bool = False):
         toks = _tokens(s)
         if normalize_cast_expr:
@@ -623,6 +623,36 @@ def MacroApply(pre_src_line: str, new_src_line: str, line_type_table, ft=None) -
 
     return return_line
 
+def _pretty_analyze_result(x: dict) -> str:
+    """CodeAnalyzer の解析結果を見やすく整形して返す（巨大/非JSONなものだけ潰して全項目を出す）。"""
+    if not isinstance(x, dict):
+        return str(x)
+
+    def _simplify(obj):
+        # clang Cursor など、JSON化できない/巨大なものを短縮
+        try:
+            if isinstance(obj, dict):
+                out = {}
+                for k, v in obj.items():
+                    if k in {"operator_cursor", "left_val_cursor_head", "right_val_cursor_head"}:
+                        # 参照情報は巨大なので簡略化（キー自体は残す）
+                        out[k] = "<clang-cursor>"
+                        continue
+                    out[k] = _simplify(v)
+                return out
+            if isinstance(obj, list):
+                return [_simplify(v) for v in obj]
+            if isinstance(obj, tuple):
+                return [_simplify(v) for v in obj]
+        except Exception:
+            pass
+        return obj
+
+    y = _simplify(x)
+
+    # ★間引きはしない（eval_datas も含めて全て出す）
+    return json.dumps(y, ensure_ascii=False, indent=2)
+
 if __name__ == "__main__":
     src = "../test_kaizen/example.c"
     args = [
@@ -637,28 +667,44 @@ if __name__ == "__main__":
     mgr = CommitManager(repo_path='../test_kaizen', user_name='kazukig', user_email='mannen5656@gmail.com', token="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")
     
     #指摘表([指摘番号,行番号])
-    chlist = [[0,105]]
+    chlist = [[0,106]]
     for coords in chlist:
         
         print("--------------------------[ Analyze Start ] --------------------------")
         #srcファイルを解析して指定行の指摘をキャスト用解析のjsonフォーマットにコンパイルする。
         analyzer = CodeAnalyzer(src_file=src, compile_args=args, check_list=coords[1])
-        x = analyzer.compile()
-        print("解析結果:", x)
+
+        # 追加: CodeAnalyzer.all_AST に渡す analyzeInfo の例（1件）
+        analyzeInfo = {
+            "line": coords[1],  # 解析対象の行番号（1始まり）
+            "data": {
+                "col": 1,  # （必要なら）変更箇所の列。未使用なら1でOK
+                "analizeID": f"A-{coords[0]}",
+                "op": {
+                    "operator": "+",             # 対象演算子
+                    "operator_exitcolnum": 1      # 左から何個目のその演算子か（1始まり）
+                }
+            }
+        }
+
+        x = analyzer.all_AST(analyzeInfo)
+        print("解析結果:\n" + _pretty_analyze_result(x))
+        #exit(1)
 
         #exit(1)
         #[TBD] 以下でとりあえず関数テーブルを作成したが不必要なものも多い。
-        ft = FunctionTable(tu=analyzer.getTu(), srcfile=src, preproc_map=analyzer.getpreprocmap())
-        print(ft.make())  # これを追加（関数テーブルを構築して self.data に入れる）
-        print("--------------------------[ Analyze Finish ] --------------------------")
+        #ft = FunctionTable(tu=analyzer.getTu(), srcfile=src, preproc_map=analyzer.getpreprocmap())
+        #print(ft.make())  # これを追加（関数テーブルを構築して self.data に入れる）
+        #print("--------------------------[ Analyze Finish ] --------------------------")
 
 
         print("--------------------------[ Cast Start ] --------------------------")
         # SignedTypeFixer にテーブルを渡す
         fixer = SignedTypeFixer(src_file=src, compile_args=args, macro_table=None, type_table=ttab)
         # 例: 指摘番号 0, 行 157 を処理
-        res = fixer.solveSignedTypedConflict(x["trees"])
+        res = fixer.solveSignedTypedConflict(x)
         print("修正結果:", res)
+        exit(1)
 
         #テキスト変換
         print("--------------------------[ Cast Transform ] --------------------------")
